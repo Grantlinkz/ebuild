@@ -61,6 +61,16 @@ _SIZE_LINE = re.compile(
     r"^\s*(?P<text>\d+)\s+(?P<data>\d+)\s+(?P<bss>\d+)\s+\d+\s+[0-9a-fA-F]+\s"
 )
 
+#: Apple's size(1) prints "__TEXT __DATA __OBJC others" instead of the
+#: Berkeley "text data bss" columns. _SIZE_LINE matches that row too and
+#: read __OBJC -- always 0 -- as bss, so every footprint measured on macOS
+#: silently reported RAM without any zero-initialised data in it.
+_MACHO_COLUMNS = re.compile(r"^\s*__TEXT\s+__DATA\s+__OBJC\s+others\b")
+_MACHO_SEGMENT = re.compile(r"^Segment\s+(?P<name>\S+?):\s+(?P<size>\d+)")
+_MACHO_SECTION = re.compile(
+    r"^\s+Section\s+(?P<name>\S+?):\s+(?P<size>\d+)(?P<zero>\s*\(zerofill\))?"
+)
+
 
 class FootprintError(RuntimeError):
     """Raised when a footprint cannot be measured."""
@@ -105,6 +115,55 @@ def find_size_tool(toolchain_prefix: Optional[str] = None) -> Optional[str]:
     return shutil.which("size")
 
 
+def _run_size(tool: str, args: list, artifact: Path):
+    """Run the size tool, turning every failure mode into FootprintError."""
+    try:
+        proc = subprocess.run([tool] + args, capture_output=True,
+                              text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FootprintError(f"{tool} failed on {artifact}: {exc}") from exc
+    if proc.returncode != 0:
+        raise FootprintError(
+            f"{tool} exited {proc.returncode} on {artifact}: "
+            f"{(proc.stderr or proc.stdout).strip()[:200]}"
+        )
+    return proc
+
+
+def _measure_macho(tool: str, artifact: Path) -> "Footprint":
+    """Section sizes from Apple size(1), which needs -m to report them.
+
+    Sections rather than segments: a segment is page-aligned, so __TEXT
+    reads as 16 KB for 112 bytes of code. The Berkeley numbers this
+    mirrors are section sizes, and the two tools must not disagree about
+    what a number means.
+    """
+    proc = _run_size(tool, ["-m", str(artifact)], artifact)
+    text = data = bss = 0
+    segment = ""
+    for line in proc.stdout.splitlines():
+        seg = _MACHO_SEGMENT.match(line)
+        if seg:
+            segment = seg.group("name")
+            continue
+        sec = _MACHO_SECTION.match(line)
+        if not sec:
+            continue
+        size = int(sec.group("size"))
+        if sec.group("zero"):
+            bss += size          # zerofill: RAM only, never stored
+        elif segment == "__TEXT":
+            text += size
+        elif segment not in ("__PAGEZERO", "__LINKEDIT"):
+            data += size
+    if not (text or data or bss):
+        raise FootprintError(
+            f"could not read any section size from {tool} -m output "
+            f"for {artifact}"
+        )
+    return Footprint(text=text, data=data, bss=bss)
+
+
 def measure(artifact: Path, size_tool: Optional[str] = None) -> Footprint:
     """Section sizes of ``artifact``.
 
@@ -122,19 +181,14 @@ def measure(artifact: Path, size_tool: Optional[str] = None) -> Footprint:
             "(install binutils, or the toolchain's binutils for a cross build)"
         )
 
-    try:
-        proc = subprocess.run([tool, str(artifact)], capture_output=True,
-                              text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise FootprintError(f"{tool} failed on {artifact}: {exc}") from exc
-
-    if proc.returncode != 0:
-        raise FootprintError(
-            f"{tool} exited {proc.returncode} on {artifact}: "
-            f"{(proc.stderr or proc.stdout).strip()[:200]}"
-        )
+    proc = _run_size(tool, [str(artifact)], artifact)
 
     for line in proc.stdout.splitlines():
+        # Apple size(1) leads with a column header naming Mach-O segments.
+        # Its data row matches _SIZE_LINE, so without this the __OBJC
+        # column is silently taken for bss.
+        if _MACHO_COLUMNS.match(line):
+            return _measure_macho(tool, artifact)
         m = _SIZE_LINE.match(line)
         if m:
             return Footprint(text=int(m.group("text")),
