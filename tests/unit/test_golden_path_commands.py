@@ -17,6 +17,7 @@ import yaml
 from click.testing import CliRunner
 
 from ebuild.cli.commands import (
+    _board_config,
     _cached_repo_libraries,
     _record_board_selection,
     _resolve_test_runner,
@@ -82,6 +83,48 @@ class TestBoardSelection:
         with pytest.raises(SystemExit):
             _record_board_selection("stm32f4", _SilentLog())
         assert not Path("eos.yaml").exists()
+
+
+@pytest.mark.ebuild
+class TestProjectBoardConfig:
+    """A family spans several densities -- an STM32F407 has 1 MB of flash and
+    an STM32F401 has 256 KB -- so a project that states its own numbers must
+    not be measured against the reference part for its family."""
+
+    def test_no_board_yaml_is_not_an_error(self, tmp_path, monkeypatch):
+        """Most projects ship none, and the reference table covers them."""
+        monkeypatch.chdir(tmp_path)
+        assert _board_config() is None
+
+    def test_the_project_s_own_numbers_are_read_back(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        Path("board.yaml").write_text(
+            yaml.safe_dump({"memory": {"flash": "256K", "ram": "64K"}}),
+            encoding="utf-8")
+        assert _board_config() == {"memory": {"flash": "256K", "ram": "64K"}}
+
+    def test_unparseable_yaml_falls_back_instead_of_failing_the_build(
+            self, tmp_path, monkeypatch):
+        """The footprint report is a convenience. Failing a build that linked
+        over a malformed board.yaml would be worse than the silence it
+        replaces, so this degrades to the reference table."""
+        monkeypatch.chdir(tmp_path)
+        Path("board.yaml").write_text("memory: {flash: [unclosed\n",
+                                      encoding="utf-8")
+        assert _board_config() is None
+
+    def test_a_yaml_document_that_is_not_a_mapping_is_ignored(
+            self, tmp_path, monkeypatch):
+        """`board_capacity` indexes into it, so a list or a bare string would
+        raise out of a build that had already succeeded."""
+        monkeypatch.chdir(tmp_path)
+        Path("board.yaml").write_text("- stm32f4\n", encoding="utf-8")
+        assert _board_config() is None
+
+    def test_an_empty_board_yaml_is_ignored(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        Path("board.yaml").write_text("", encoding="utf-8")
+        assert _board_config() is None
 
 
 @pytest.mark.ebuild

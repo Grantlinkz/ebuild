@@ -9,6 +9,7 @@ pipeline, and hardware analysis commands.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
@@ -361,6 +362,28 @@ def _resolve_backend_request(
         resolved_backend = detect_backend(source_dir)
         log.info(f"Auto-detected backend: {resolved_backend}")
 
+        # A build.yaml that declares its own targets is a statement that
+        # ebuild builds this project. detect_backend() only inspects the
+        # filesystem, so a Makefile kept for `make flash` -- or a
+        # CMakeLists.txt belonging to one subcomponent -- used to outrank
+        # that statement: the dispatcher ran the external tool, the
+        # declared targets were never built, and the build still reported
+        # success.
+        #
+        # Only auto-detection is overridden. An explicit `backend:` in
+        # build.yaml or --backend on the command line still wins, which
+        # is how a project keeps both a target list and an external
+        # build.
+        if resolved_backend != "ninja" and cfg.targets:
+            log.info(
+                f"build.yaml declares {len(cfg.targets)} target(s), so "
+                f"the ninja backend is used instead of the detected "
+                f"{resolved_backend}. To build with {resolved_backend}, "
+                f"set 'backend: {resolved_backend}' in build.yaml or "
+                f"pass --backend {resolved_backend}."
+            )
+            resolved_backend = "ninja"
+
     return resolved_backend, backend_config
 
 
@@ -521,7 +544,18 @@ def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> No
 def _board_config() -> Optional[Dict[str, Any]]:
     """The project's own board description, if it ships one.
 
-    return resolved_backend, backend_config
+    A project that states its part's real capacity should not be measured
+    against the reference part for its family.
+    """
+    path = Path("board.yaml")
+    if not path.is_file():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _configure_ninja_backend(
@@ -2411,7 +2445,10 @@ def test(log: Logger, config_path: str, build_dir: str,
     log.info(" ".join(argv))
 
     try:
-        result = subprocess.run(argv, cwd=str(cwd))
+        # Captured rather than inherited, because the exit status alone cannot
+        # distinguish "every test passed" from "there were no tests". The
+        # output is echoed below so the terminal reads as it did before.
+        result = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
     except FileNotFoundError:
         log.error(
             f"{name} is not installed or not on PATH, so the tests cannot be "
@@ -2419,11 +2456,132 @@ def test(log: Logger, config_path: str, build_dir: str,
         )
         raise SystemExit(1)
 
+    output = (result.stdout or "") + (result.stderr or "")
+    if output:
+        click.echo(output.rstrip())
+
     if result.returncode != 0:
         log.error(f"Tests failed ({name} exited {result.returncode}).")
         raise SystemExit(result.returncode)
 
-    log.success("All tests passed.")
+    # ctest exits 0 when it finds nothing to run. A CMakeLists with
+    # enable_testing() and no add_test() produces a CTestTestfile.cmake, so the
+    # runner is found, ctest prints "No tests were found!!!", exits 0, and the
+    # only honest reading of that is not "All tests passed".
+    if _ran_no_tests(name, output):
+        log.error(f"{name} completed without running a single test.")
+        log.info("  A pass here would mean nothing; treating it as a failure.")
+        raise SystemExit(1)
+
+    counts = _parse_test_counts(name, output)
+    if counts is not None:
+        passed, failed = counts
+        log.success(f"All tests passed ({passed} passed, {failed} failed).")
+    else:
+        # No recognised summary. Report the verdict without inventing a number
+        # the runner did not print.
+        log.success("All tests passed.")
+
+
+
+@cli.command()
+@click.option("--config", "config_path", default="build.yaml",
+              type=click.Path(), help="Path to the build configuration file.")
+@click.option("--build-dir", default="_build", type=click.Path(),
+              help="Build output directory.")
+@click.option("--output", "output_path", default=None, type=click.Path(),
+              help="Destination .efw path. Defaults to <project>.efw.")
+@click.option("--load", "load_addr", default=None,
+              help="Load address, e.g. 0x08000000.")
+@click.option("--entry", "entry_addr", default=None,
+              help="Entry address, e.g. 0x08000100.")
+@click.pass_obj
+def package(log: Logger, config_path: str, build_dir: str,
+            output_path: Optional[str], load_addr: Optional[str],
+            entry_addr: Optional[str]) -> None:
+    """Assemble the built artifact into an eFirmware `.efw` image.
+
+    The step §29's development-to-device flow puts between eBuild and the
+    device. eFirmware implements the format and ships `efwtool`; this drives
+    it, so a developer does not have to know the tool exists.
+    """
+    from ebuild.build.firmware_image import (
+        FirmwareImageError, find_efwtool, missing_tool_message, pack, verify,
+    )
+    from ebuild.deps import EBUILD_REPOS_DIR
+
+    log.header("ebuild — Package")
+
+    try:
+        cfg = load_config(config_path)
+    except FileNotFoundError:
+        log.error(f"No {config_path} here. Run this from a project directory.")
+        raise SystemExit(1)
+    except (ConfigError, RecipeError) as e:
+        log.error(f"Configuration error: {e}")
+        raise SystemExit(1)
+
+    binaries = [t for t in cfg.targets if t.target_type == "executable"]
+    if not binaries:
+        log.error("No executable target in build.yaml — nothing to package.")
+        raise SystemExit(1)
+
+    artifact = Path(build_dir) / binaries[0].name
+    if not artifact.is_file():
+        log.error(f"No built artifact at {artifact}. Run 'ebuild build' first.")
+        raise SystemExit(1)
+
+    efwtool = find_efwtool(Path(EBUILD_REPOS_DIR))
+    if efwtool is None:
+        log.error(missing_tool_message(Path(EBUILD_REPOS_DIR)))
+        raise SystemExit(1)
+
+    output = Path(output_path or f"{cfg.name}.efw")
+    log.step(f"Packing {artifact.name} -> {output}")
+    try:
+        pack(efwtool, artifact, output, version=cfg.version or "0.0.0",
+             load_addr=load_addr, entry_addr=entry_addr)
+        verdict = verify(efwtool, output)
+    except FirmwareImageError as exc:
+        log.error(str(exc))
+        raise SystemExit(1)
+
+    log.success(f"{output} ({output.stat().st_size} bytes)")
+    for line in verdict.splitlines():
+        log.info(f"  {line}")
+    log.info("")
+    log.info(f"Inspect it with:  {efwtool} inspect {output}")
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True,
+              help="Emit the checks as JSON, for CI.")
+@click.pass_obj
+def doctor(log: Logger, as_json: bool) -> None:
+    """Diagnose the build environment in one command.
+
+    Reports what is installed, what is missing, and what each missing piece
+    would cost. Read-only: it names the fix rather than applying it.
+
+    Exits non-zero only for problems that actually stop a build, so a
+    host-only machine with no cross toolchain still passes.
+    """
+    from ebuild.system.doctor import exit_code, format_report, run_all
+
+    checks = run_all()
+
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(
+            [{"name": c.name, "status": c.status,
+              "detail": c.detail, "fix": c.fix} for c in checks],
+            indent=2,
+        ))
+        raise SystemExit(exit_code(checks))
+
+    log.header("ebuild — Environment")
+    for line in format_report(checks).splitlines():
+        click.echo(line)
+    raise SystemExit(exit_code(checks))
 
 
 def _run_native_tests(
@@ -2484,6 +2642,60 @@ def _run_native_tests(
         raise SystemExit(1)
 
     log.success(f"All {len(selected)} test targets passed.")
+
+
+#: What each runner prints when it completed having executed nothing. ctest's is
+#: the one that matters: it pairs the message with a zero exit status.
+_NO_TESTS_MARKERS = {
+    "ctest": ("No tests were found",),
+    "meson test": ("No tests defined",),
+    "cargo test": ("running 0 tests",),
+}
+
+#: Each runner's own summary line, anchored to the phrasing it prints so that a
+#: format change shows up as "no counts" rather than as a wrong number.
+_TEST_COUNT_PATTERNS = {
+    "ctest": re.compile(
+        r"tests passed,\s*(?P<failed>\d+)\s+tests? failed out of\s*(?P<total>\d+)"),
+    "meson test": re.compile(
+        r"^Ok:\s*(?P<passed>\d+).*?^Fail:\s*(?P<failed>\d+)", re.S | re.M),
+    "cargo test": re.compile(
+        r"test result:.*?(?P<passed>\d+) passed;\s*(?P<failed>\d+) failed"),
+}
+
+
+def _ran_no_tests(name: str, output: str) -> bool:
+    """True when the runner finished having executed nothing.
+
+    Checked two ways because neither is reliable alone: the marker phrase
+    catches ctest, which prints no summary at all in this case, and the counts
+    catch a runner that prints a well-formed summary totalling zero.
+    """
+    for marker in _NO_TESTS_MARKERS.get(name, ()):
+        if marker in output:
+            return True
+    counts = _parse_test_counts(name, output)
+    return counts is not None and counts[0] + counts[1] == 0
+
+
+def _parse_test_counts(name: str, output: str):
+    """(passed, failed) from the runner's own summary, or None.
+
+    `make test` has no standard summary format. Rather than invent one, its
+    counts stay unknown and the exit status carries the verdict.
+    """
+    pattern = _TEST_COUNT_PATTERNS.get(name)
+    if pattern is None:
+        return None
+    match = pattern.search(output)
+    if not match:
+        return None
+    groups = match.groupdict()
+    failed = int(groups["failed"])
+    if groups.get("passed") is not None:
+        return int(groups["passed"]), failed
+    # ctest reports failures out of a total; passed is the remainder.
+    return int(groups["total"]) - failed, failed
 
 
 def _resolve_test_runner(

@@ -14,6 +14,7 @@ the two tools disagree about what "flash" means:
     ram   = data + bss
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,8 @@ import pytest
 from ebuild.build.footprint import (
     Footprint,
     FootprintError,
+    _measure_macho,
+    _run_size,
     board_capacity,
     find_size_tool,
     format_report,
@@ -57,7 +60,9 @@ class TestMeasure:
     def test_measures_a_real_binary(self, tmp_path):
         src = tmp_path / "m.c"
         src.write_text("static char buf[4096];\nint main(void){return buf[0];}\n")
-        exe = tmp_path / "m"
+        # gcc on Windows appends .exe when -o names no extension, so the
+        # path measured here has to carry it or there is nothing to measure.
+        exe = tmp_path / ("m.exe" if os.name == "nt" else "m")
         subprocess.run(["gcc", str(src), "-o", str(exe)], check=True)
 
         fp = measure(exe)
@@ -196,3 +201,158 @@ class TestFormatSize:
     ])
     def test_units(self, n, expected):
         assert format_size(n) == expected
+
+
+def _completed(returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(
+        args=["size"], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class TestSizeToolFailures:
+    """`_run_size` is the single place every `size` invocation goes through, so
+    a failure mode it does not convert into FootprintError escapes as a bare
+    OSError and takes down a build that otherwise succeeded."""
+
+    def test_a_tool_that_cannot_be_executed_becomes_a_footprint_error(
+            self, tmp_path, monkeypatch):
+        def boom(*_a, **_kw):
+            raise OSError("Exec format error")
+
+        monkeypatch.setattr(subprocess, "run", boom)
+        with pytest.raises(FootprintError, match="Exec format error"):
+            _run_size("size", [], tmp_path / "app")
+
+    def test_a_tool_that_hangs_becomes_a_footprint_error(
+            self, tmp_path, monkeypatch):
+        """The 60 s timeout exists so a wedged `size` cannot hang the build;
+        the expiry has to arrive as a FootprintError like every other
+        failure, or the timeout just changes which exception escapes."""
+        def hang(*_a, **_kw):
+            raise subprocess.TimeoutExpired(cmd="size", timeout=60)
+
+        monkeypatch.setattr(subprocess, "run", hang)
+        with pytest.raises(FootprintError, match="failed on"):
+            _run_size("size", [], tmp_path / "app")
+
+    def test_a_nonzero_exit_reports_the_tool_s_own_message(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *_a, **_kw: _completed(1, stderr="not an object file"))
+        with pytest.raises(FootprintError, match="not an object file"):
+            _run_size("size", [], tmp_path / "app")
+
+
+#: Real `size -m` output, from a host binary with 4 bytes of initialised data
+#: and a 4 KB zero-initialised buffer. Reproduced verbatim rather than
+#: measured, because the parsing has to be exercised on the Linux and Windows
+#: legs too -- where no Mach-O binary can be produced and every line of this
+#: parser would otherwise go unrun.
+_MACHO_SIZE_M = """\
+Segment __PAGEZERO: 4294967296 (zero fill)
+Segment __TEXT: 16384
+\tSection __text: 36
+\tSection __unwind_info: 88
+\ttotal 124
+Segment __DATA: 16384
+\tSection __data: 4
+\tSection __bss: 4096 (zerofill)
+\ttotal 4100
+Segment __LINKEDIT: 16384
+total 4295016448
+"""
+
+
+class TestMachOSections:
+    """Apple's size(1) reports segments, which are page-aligned: __TEXT reads
+    as 16 KB for the 124 bytes below. Only the section numbers mean what the
+    Berkeley columns mean, and the two tools must not disagree."""
+
+    def _measured(self, monkeypatch, stdout):
+        monkeypatch.setattr(subprocess, "run",
+                            lambda *_a, **_kw: _completed(stdout=stdout))
+        return _measure_macho("size", Path("app"))
+
+    def test_sections_land_in_the_region_that_holds_them(self, monkeypatch):
+        fp = self._measured(monkeypatch, _MACHO_SIZE_M)
+        assert fp.text == 36 + 88
+        assert fp.data == 4       # __data: stored in the image and copied to RAM
+        assert fp.bss == 4096     # zerofill: RAM only
+
+    def test_the_page_aligned_segment_totals_are_not_the_answer(self, monkeypatch):
+        """Reading "Segment __TEXT: 16384" would report 16 KB of flash for
+        124 bytes of code, and disagree with `size` on the same binary."""
+        fp = self._measured(monkeypatch, _MACHO_SIZE_M)
+        assert fp.flash == 128
+        assert 16384 not in (fp.text, fp.data, fp.bss)
+
+    def test_linkedit_and_pagezero_are_not_charged_to_the_image(self, monkeypatch):
+        """__LINKEDIT holds symbol tables stripped at load and __PAGEZERO is
+        an unmapped guard region. Neither costs the device anything, and
+        __PAGEZERO alone would add 4 GB of "data"."""
+        fp = self._measured(monkeypatch, _MACHO_SIZE_M + (
+            "Segment __LINKEDIT: 16384\n"
+            "\tSection __symtab: 900\n"
+        ))
+        assert fp.data == 4
+
+    def test_a_non_text_segment_is_charged_to_data(self, monkeypatch):
+        """__DATA_CONST is neither __TEXT nor zerofill: it is stored in the
+        image, so it is flash, and dropping it would understate the binary."""
+        fp = self._measured(monkeypatch, (
+            "Segment __DATA_CONST: 16384\n"
+            "\tSection __const: 256\n"
+        ))
+        assert fp.data == 256
+        assert fp.text == 0
+
+    def test_output_with_no_sections_raises_rather_than_reporting_zero(
+            self, monkeypatch):
+        """A parser that stopped matching would otherwise report a firmware
+        image of 0 bytes, which reads as a successful measurement."""
+        with pytest.raises(FootprintError, match="could not read any section"):
+            self._measured(monkeypatch, "Segment __TEXT: 16384\ntotal 16384\n")
+
+
+class TestOutputFormatDispatch:
+    """Which parser runs is decided by the output, not by the host platform,
+    so both branches are reachable from either."""
+
+    def _measure_with(self, tmp_path, monkeypatch, stdout):
+        artifact = tmp_path / "app"
+        artifact.write_bytes(b"\x7fELF")
+        monkeypatch.setattr(subprocess, "run",
+                            lambda *_a, **_kw: _completed(stdout=stdout))
+        return measure(artifact, size_tool="size")
+
+    def test_berkeley_columns_are_read_as_text_data_bss(self, tmp_path, monkeypatch):
+        fp = self._measure_with(tmp_path, monkeypatch, (
+            "   text\t   data\t    bss\t    dec\t    hex\tfilename\n"
+            "   1720\t    600\t   4096\t   6416\t   1910\tapp\n"
+        ))
+        assert (fp.text, fp.data, fp.bss) == (1720, 600, 4096)
+
+    def test_the_apple_column_header_routes_to_the_section_parser(
+            self, tmp_path, monkeypatch):
+        """Apple's header row matches _SIZE_LINE too, and its __OBJC column --
+        always 0 -- was being read as bss. Every footprint measured on macOS
+        reported RAM with no zero-initialised data in it."""
+        columns = ("__TEXT\t__DATA\t__OBJC\tothers\tdec\thex\n"
+                   "16384\t16384\t0\t4294983680\t4295016448\t10000c000\n")
+
+        def size(argv, **_kw):
+            # The second call is the `-m` re-run the header should trigger.
+            return _completed(stdout=_MACHO_SIZE_M if "-m" in argv else columns)
+
+        artifact = tmp_path / "app"
+        artifact.write_bytes(b"\x7fELF")
+        monkeypatch.setattr(subprocess, "run", size)
+
+        fp = measure(artifact, size_tool="size")
+        assert fp.bss == 4096, "the __OBJC column was read as bss"
+        assert fp.flash == 128
+
+    def test_unparseable_output_raises_rather_than_reporting_zero(
+            self, tmp_path, monkeypatch):
+        with pytest.raises(FootprintError, match="could not read a size line"):
+            self._measure_with(tmp_path, monkeypatch, "size: bad file\n")

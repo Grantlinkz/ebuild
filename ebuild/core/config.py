@@ -341,4 +341,8 @@ def load_config(config_path: str | Path) -> ProjectConfig:
         source_dir=config_path.parent,
         backend=backend,
         backend_config=backend_config,
+        # Parsed and validated above, but never handed to the config:
+        # every consumer saw an empty mapping and the whole [system]
+        # section was silently inert.
+        system_config=system_config,
     )

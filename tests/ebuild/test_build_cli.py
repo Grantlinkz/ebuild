@@ -29,6 +29,11 @@ def test_system_only_config_does_not_report_build_success(tmp_path):
 
     assert result.exit_code == 1
     assert "Auto-detected backend: ninja" in result.output
-    assert "BackendDispatcher cannot handle backend 'ninja'" in result.output
+    # The dispatcher raised this through two separate mechanisms that a
+    # merge left side by side; they are now one, and the surviving message
+    # also says what to do about it. The guarantee under test -- ninja is
+    # rejected here rather than silently no-op'd -- is unchanged.
+    assert "Unknown build backend 'ninja'" in result.output
+    assert "requires 'targets' in build.yaml" in result.output
     assert "Build completed successfully" not in result.output
     assert not build_dir.exists()

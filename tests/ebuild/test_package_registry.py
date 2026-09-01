@@ -78,10 +78,14 @@ def test_out_of_format_versions_order_deterministically():
 
     ordered = [r.version for r in registry.list_all_versions("demo")]
 
-    # Out-of-format versions rank below every numeric one; numeric versions
-    # keep the ordering guaranteed by
-    # test_list_all_versions_uses_numeric_version_order.
-    assert ordered == ["1.2.13-1", "v2.9.3", "1.9.0", "1.10.0"]
+    # The registry orders through version_sort_key, which reads these forms
+    # rather than ranking them all below the numeric ones: a leading "v" is
+    # ignored (v2.9.3 is littlefs's own tag format, so it has to order as
+    # 2.9.3, not below 1.10.0), and a suffix sorts just under the release it
+    # qualifies, so 1.2.13-1 precedes 1.9.0. The registry previously used a
+    # second, private key that ranked every non-numeric version below every
+    # numeric one; the two disagreed and only the private one was wired in.
+    assert ordered == ["1.2.13-1", "1.9.0", "1.10.0", "v2.9.3"]
 
 
 def test_one_out_of_format_recipe_does_not_hide_valid_packages():

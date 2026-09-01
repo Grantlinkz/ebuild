@@ -12,6 +12,7 @@ import pytest
 from ebuild.build.dispatch import (
     ALL_BACKENDS,
     BackendDispatcher,
+    BackendError,
     UnknownBackendError,
     detect_backend,
 )

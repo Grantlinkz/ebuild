@@ -81,8 +81,12 @@ class TestNinjaBackendSharedLibrary(unittest.TestCase):
             self.assertNotIn(": link ", edge)
 
 
-class TestNinjaPathEscaping(unittest.TestCase):
+class TestNinjaPathEscapingContract(unittest.TestCase):
     """Ninja splits build statements on unescaped spaces and colons.
+
+    Renamed from TestNinjaPathEscaping: a second class of that name is
+    defined further down this file, and the later definition replaced this
+    one, so none of these four ever ran.
 
     A Windows absolute path puts a drive-letter colon into the output field, so
     Ninja read the statement as a rule separator and rejected every generated
@@ -92,15 +96,15 @@ class TestNinjaPathEscaping(unittest.TestCase):
     """
 
     def test_colons_and_spaces_in_paths_are_escaped(self):
-        self.assertEqual(_ninja_path(r"C:\build\main.o"), r"C$:\build\main.o")
-        self.assertEqual(_ninja_path("/tmp/my project/main.o"), "/tmp/my$ project/main.o")
+        self.assertEqual(escape_ninja_path(r"C:\build\main.o"), r"C$:\build\main.o")
+        self.assertEqual(escape_ninja_path("/tmp/my project/main.o"), "/tmp/my$ project/main.o")
 
     def test_dollar_is_escaped_before_the_escapes_it_introduces(self):
-        self.assertEqual(_ninja_path("a$b"), "a$$b")
-        self.assertEqual(_ninja_path("a$b:c"), "a$$b$:c")
+        self.assertEqual(escape_ninja_path("a$b"), "a$$b")
+        self.assertEqual(escape_ninja_path("a$b:c"), "a$$b$:c")
 
     def test_ordinary_posix_paths_are_unchanged(self):
-        self.assertEqual(_ninja_path("/tmp/build/obj/app/src/main.o"),
+        self.assertEqual(escape_ninja_path("/tmp/build/obj/app/src/main.o"),
                          "/tmp/build/obj/app/src/main.o")
 
     def test_every_build_statement_has_one_unescaped_colon(self):

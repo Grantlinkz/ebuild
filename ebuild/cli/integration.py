@@ -623,7 +623,13 @@ def register_commands(cli_group: click.Group) -> None:
         sdk_dir = generate_sdk(target, output)
         log.success("SDK generated: " + str(sdk_dir))
 
-    @cli_group.command()
+    # Named "package-deliverable", not "package": #77 added a `package`
+    # command that writes an eFirmware .efw image, and register_commands()
+    # runs last, so this one silently replaced it on the group and
+    # tests/unit/test_package_efw.py got this signature instead. Two
+    # different deliverables cannot share one name; the .efw image keeps
+    # "package" because it is the step in the device flow.
+    @cli_group.command("package-deliverable")
     @click.option("--target", required=True, help="Target hardware (e.g., raspi4)")
     @click.option("--version", default=__version__, help="Release version")
     @click.option("--build-dir", default="build", help="Build directory with compiled artifacts")

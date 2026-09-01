@@ -27,48 +27,6 @@ ALL_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild", "ninja"}
 SUPPORTED_BACKENDS = TIER_1 | TIER_2 | TIER_3
 
 
-class BackendError(RuntimeError):
-    """Raised when the external dispatcher cannot handle a backend."""
-
-
-def _validate_backend(backend: str, supported: Set[str]) -> None:
-    """Reject values that the requested dispatcher operation cannot handle."""
-    if backend in supported:
-        return
-
-    if backend in ALL_BACKENDS:
-        message = f"BackendDispatcher cannot handle backend '{backend}'."
-    else:
-        message = f"Unknown build backend '{backend}'."
-
-    supported_names = ", ".join(sorted(supported))
-    raise BackendError(f"{message} Supported backends: {supported_names}.")
-
-#: Backends this dispatcher actually drives. "ninja" is ebuild's own backend --
-#: the CLI invokes NinjaBackend directly and never routes it through here.
-DISPATCHED_BACKENDS = {"cmake", "make", "meson", "cargo", "kbuild"}
-
-
-class UnknownBackendError(ValueError, RuntimeError):
-    """Raised when a backend reaches the dispatcher that it cannot drive.
-
-    Subclasses both ValueError and RuntimeError: callers treat an unrecognized
-    backend name as a bad argument, while the CLI treats a backend it failed to
-    route (notably "ninja") as a routing failure. Silently doing nothing here is
-    what made `ebuild build` report "Build completed successfully" without ever
-    running a compiler.
-    """
-
-
-def _unknown_backend(backend: str, step: str) -> UnknownBackendError:
-    return UnknownBackendError(
-        f"Unknown build backend '{backend}'. "
-        f"Supported backends: {', '.join(sorted(DISPATCHED_BACKENDS))}. "
-        "ebuild's own 'ninja' backend is invoked directly by the CLI and is "
-        f"not dispatched here, so it cannot be {step} through BackendDispatcher."
-    )
-
-
 def ninja_command():
     """Return the argv prefix that runs ninja on this machine.
 
@@ -106,6 +64,10 @@ class UnknownBackendError(ValueError, RuntimeError):
     may catch either. New code should catch ``UnknownBackendError``.
     """
 
+
+#: The name this error carried before the two mechanisms were consolidated.
+#: Kept so callers and tests that import it keep working.
+BackendError = UnknownBackendError
 
 def _unknown_backend(backend: str, action: str, supported: set) -> UnknownBackendError:
     """Build the error raised for a backend a step cannot handle.
@@ -204,7 +166,13 @@ class BackendDispatcher:
         Raises:
             UnknownBackendError: If this step does not handle the backend.
         """
-        _validate_backend(backend, SUPPORTED_BACKENDS)
+        # Reject before any side effect. The removed duplicate validation
+        # ran ahead of the mkdir below; raising only from the else branch
+        # left a stray build directory behind for a backend this step
+        # never handles.
+        if backend not in CONFIGURE_BACKENDS:
+            raise _unknown_backend(backend, "configure", CONFIGURE_BACKENDS)
+
         config = config or {}
         self.build_dir.mkdir(parents=True, exist_ok=True)
 
@@ -244,7 +212,6 @@ class BackendDispatcher:
         Raises:
             UnknownBackendError: If this step does not handle the backend.
         """
-        _validate_backend(backend, SUPPORTED_BACKENDS)
         config = config or {}
 
         if backend == "cmake":
@@ -291,7 +258,6 @@ class BackendDispatcher:
         Raises:
             UnknownBackendError: If this step does not handle the backend.
         """
-        _validate_backend(backend, ALL_BACKENDS)
         if backend == "cmake":
             _run_or_log(
                 ["cmake", "--build", str(self.build_dir), "--target", "clean"],
