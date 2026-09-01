@@ -81,8 +81,12 @@ class TestNinjaBackendSharedLibrary(unittest.TestCase):
             self.assertNotIn(": link ", edge)
 
 
-class TestNinjaPathEscaping(unittest.TestCase):
+class TestNinjaPathEscapingContract(unittest.TestCase):
     """Ninja splits build statements on unescaped spaces and colons.
+
+    Renamed from TestNinjaPathEscaping: a second class of that name is
+    defined further down this file, and the later definition replaced this
+    one, so none of these four ever ran.
 
     A Windows absolute path puts a drive-letter colon into the output field, so
     Ninja read the statement as a rule separator and rejected every generated

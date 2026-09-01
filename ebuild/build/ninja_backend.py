@@ -98,22 +98,6 @@ class NinjaBackend:
         self._write_ninja()
         self._write_compile_commands()
 
-    def _object_path(self, target, src: str) -> Path:
-        """Object file path for *src* as compiled by *target*.
-
-        Object paths are namespaced by target name. Two targets may legitimately
-        list the same source: a library and a test binary sharing a helper, or
-        one source built twice with different defines. Each needs its own
-        object, because each compiles with its own cflags. Keying only on the
-        source made both targets claim one output, which ninja rejects with
-        "multiple rules generate ...".
-
-        Example:
-            >>> backend._object_path(target, "src/main.c")   # target.name == "app"
-            PosixPath('_build/obj/app/src/main.o')
-        """
-        return (self.build_dir / "obj" / target.name / src).with_suffix(".o")
-
     def _get_toolchain_cflags(self) -> List[str]:
         """Return toolchain-level cflags including sysroot.
 
