@@ -521,7 +521,18 @@ def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> No
 def _board_config() -> Optional[Dict[str, Any]]:
     """The project's own board description, if it ships one.
 
-    return resolved_backend, backend_config
+    A project that states its part's real capacity should not be measured
+    against the reference part for its family.
+    """
+    path = Path("board.yaml")
+    if not path.is_file():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _configure_ninja_backend(
@@ -2411,7 +2422,10 @@ def test(log: Logger, config_path: str, build_dir: str,
     log.info(" ".join(argv))
 
     try:
-        result = subprocess.run(argv, cwd=str(cwd))
+        # Captured rather than inherited, because the exit status alone cannot
+        # distinguish "every test passed" from "there were no tests". The
+        # output is echoed below so the terminal reads as it did before.
+        result = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
     except FileNotFoundError:
         log.error(
             f"{name} is not installed or not on PATH, so the tests cannot be "
@@ -2419,11 +2433,32 @@ def test(log: Logger, config_path: str, build_dir: str,
         )
         raise SystemExit(1)
 
+    output = (result.stdout or "") + (result.stderr or "")
+    if output:
+        click.echo(output.rstrip())
+
     if result.returncode != 0:
         log.error(f"Tests failed ({name} exited {result.returncode}).")
         raise SystemExit(result.returncode)
 
-    log.success("All tests passed.")
+    # ctest exits 0 when it finds nothing to run. A CMakeLists with
+    # enable_testing() and no add_test() produces a CTestTestfile.cmake, so the
+    # runner is found, ctest prints "No tests were found!!!", exits 0, and the
+    # only honest reading of that is not "All tests passed".
+    if _ran_no_tests(name, output):
+        log.error(f"{name} completed without running a single test.")
+        log.info("  A pass here would mean nothing; treating it as a failure.")
+        raise SystemExit(1)
+
+    counts = _parse_test_counts(name, output)
+    if counts is not None:
+        passed, failed = counts
+        log.success(f"All tests passed ({passed} passed, {failed} failed).")
+    else:
+        # No recognised summary. Report the verdict without inventing a number
+        # the runner did not print.
+        log.success("All tests passed.")
+
 
 
 def _run_native_tests(
@@ -2484,6 +2519,60 @@ def _run_native_tests(
         raise SystemExit(1)
 
     log.success(f"All {len(selected)} test targets passed.")
+
+
+#: What each runner prints when it completed having executed nothing. ctest's is
+#: the one that matters: it pairs the message with a zero exit status.
+_NO_TESTS_MARKERS = {
+    "ctest": ("No tests were found",),
+    "meson test": ("No tests defined",),
+    "cargo test": ("running 0 tests",),
+}
+
+#: Each runner's own summary line, anchored to the phrasing it prints so that a
+#: format change shows up as "no counts" rather than as a wrong number.
+_TEST_COUNT_PATTERNS = {
+    "ctest": re.compile(
+        r"tests passed,\s*(?P<failed>\d+)\s+tests? failed out of\s*(?P<total>\d+)"),
+    "meson test": re.compile(
+        r"^Ok:\s*(?P<passed>\d+).*?^Fail:\s*(?P<failed>\d+)", re.S | re.M),
+    "cargo test": re.compile(
+        r"test result:.*?(?P<passed>\d+) passed;\s*(?P<failed>\d+) failed"),
+}
+
+
+def _ran_no_tests(name: str, output: str) -> bool:
+    """True when the runner finished having executed nothing.
+
+    Checked two ways because neither is reliable alone: the marker phrase
+    catches ctest, which prints no summary at all in this case, and the counts
+    catch a runner that prints a well-formed summary totalling zero.
+    """
+    for marker in _NO_TESTS_MARKERS.get(name, ()):
+        if marker in output:
+            return True
+    counts = _parse_test_counts(name, output)
+    return counts is not None and counts[0] + counts[1] == 0
+
+
+def _parse_test_counts(name: str, output: str):
+    """(passed, failed) from the runner's own summary, or None.
+
+    `make test` has no standard summary format. Rather than invent one, its
+    counts stay unknown and the exit status carries the verdict.
+    """
+    pattern = _TEST_COUNT_PATTERNS.get(name)
+    if pattern is None:
+        return None
+    match = pattern.search(output)
+    if not match:
+        return None
+    groups = match.groupdict()
+    failed = int(groups["failed"])
+    if groups.get("passed") is not None:
+        return int(groups["passed"]), failed
+    # ctest reports failures out of a total; passed is the remainder.
+    return int(groups["total"]) - failed, failed
 
 
 def _resolve_test_runner(
