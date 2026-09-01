@@ -31,6 +31,16 @@ _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
 
 
+def _shared_flag() -> str:
+    """The flag that makes the compiler driver emit a shared object.
+
+    macOS links dynamic libraries with -dynamiclib; ELF platforms use
+    -shared. It lives on the rule rather than on each edge so a
+    shared_library target cannot be emitted without it.
+    """
+    return "-dynamiclib" if sys.platform == "darwin" else "-shared"
+
+
 def escape_ninja_path(path) -> str:
     """Escape a path for use inside a Ninja build statement.
 
@@ -179,6 +189,13 @@ class NinjaBackend:
             "  command = $ar rcs $out $in",
             "  description = AR $out",
             "",
+            # A shared_library edge names this rule. Without the rule the
+            # generated build.ninja referenced an undefined rule and ninja
+            # refused the whole file.
+            "rule link_shared",
+            f"  command = $cc {_shared_flag()} $ldflags $in -o $out $libs",
+            "  description = LINK_SHARED $out",
+            "",
         ]
 
         toolchain_ldflags = self._get_toolchain_ldflags()
@@ -220,7 +237,7 @@ class NinjaBackend:
                 link_inputs = obj_files + dep_archives
                 out = escape_ninja_path(self.build_dir / target.name)
                 lines.append(
-                    f"build {_ninja_path(out)}: link " f"{' '.join(_ninja_path(x) for x in link_inputs)}"
+                    f"build {out}: link " f"{' '.join(link_inputs)}"
                 )
                 if ldflags:
                     lines.append(f"  ldflags = {' '.join(ldflags)}")
@@ -238,7 +255,7 @@ class NinjaBackend:
                 out = escape_ninja_path(self.build_dir / f"lib{target.name}{ext}")
 
                 if target.target_type == "static_library":
-                    lines.append(f"build {_ninja_path(out)}: ar_rule " f"{' '.join(_ninja_path(x) for x in obj_files)}")
+                    lines.append(f"build {out}: ar_rule " f"{' '.join(obj_files)}")
                 else:
                     # Shared libraries need the same -L/-l wiring executables
                     # get, which the rule preamble alone does not supply. The
@@ -254,7 +271,7 @@ class NinjaBackend:
                             for lib in pkg.libraries:
                                 libs.append(f"-l{lib}")
 
-                    lines.append(f"build {_ninja_path(out)}: link_shared " f"{' '.join(_ninja_path(x) for x in obj_files)}")
+                    lines.append(f"build {out}: link_shared " f"{' '.join(obj_files)}")
                     if ldflags:
                         lines.append(f"  ldflags = {' '.join(ldflags)}")
                     if libs:
