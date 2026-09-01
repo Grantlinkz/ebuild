@@ -18,6 +18,7 @@ repairing.
 
 import os
 import stat
+import sys
 
 import pytest
 import yaml
@@ -33,11 +34,38 @@ from ebuild.build.firmware_image import (
 from ebuild.cli.commands import cli
 
 
-def _fake_efwtool(tmp_path, body):
-    """A stand-in for efwtool, so the wiring is testable without building C."""
-    tool = tmp_path / "efwtool"
-    tool.write_text("#!/bin/sh\n" + body)
-    tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+def _fake_efwtool(tmp_path, *, exit_code=0, stderr="", writes_output=False,
+                  records_argv=False):
+    """A stand-in for efwtool, so the wiring is testable without building C.
+
+    Driven through sys.executable rather than written as a /bin/sh script:
+    Windows cannot execute one, so every test here failed there with
+    "WinError 193: %1 is not a valid Win32 application" as soon as the
+    `package` command was registered and these tests began running.
+    """
+    script = tmp_path / "_efwtool_impl.py"
+    script.write_text(
+        "import pathlib, sys\n"
+        f"if {records_argv!r}:\n"
+        "    pathlib.Path(__file__).with_name('argv.txt').write_text(\n"
+        "        ' '.join(sys.argv[1:]), encoding='utf-8')\n"
+        f"if {writes_output!r}:\n"
+        "    pathlib.Path(sys.argv[3]).touch()\n"
+        f"sys.stderr.write({stderr!r})\n"
+        f"sys.exit({exit_code!r})\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        tool = tmp_path / "efwtool.bat"
+        tool.write_text(
+            f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8"
+        )
+    else:
+        tool = tmp_path / "efwtool"
+        tool.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8"
+        )
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
     return tool
 
 
@@ -79,28 +107,28 @@ class TestMissingToolMessage:
 
 class TestPack:
     def test_a_missing_artifact_is_refused_before_the_tool_runs(self, tmp_path):
-        tool = _fake_efwtool(tmp_path, "exit 0\n")
+        tool = _fake_efwtool(tmp_path)
         with pytest.raises(FirmwareImageError, match="no artifact"):
             pack(tool, tmp_path / "nope", tmp_path / "out.efw")
 
     def test_a_tool_that_writes_nothing_is_caught(self, tmp_path):
         """efwtool exiting 0 without producing a file would otherwise be
         reported as a successful package."""
-        tool = _fake_efwtool(tmp_path, "exit 0\n")
+        tool = _fake_efwtool(tmp_path)
         payload = tmp_path / "app"
         payload.write_bytes(b"\x7fELF")
         with pytest.raises(FirmwareImageError, match="wrote no image"):
             pack(tool, payload, tmp_path / "out.efw")
 
     def test_a_failing_tool_surfaces_its_own_message(self, tmp_path):
-        tool = _fake_efwtool(tmp_path, 'echo "bad magic" >&2\nexit 3\n')
+        tool = _fake_efwtool(tmp_path, stderr="bad magic\n", exit_code=3)
         payload = tmp_path / "app"
         payload.write_bytes(b"x")
         with pytest.raises(FirmwareImageError, match="bad magic"):
             pack(tool, payload, tmp_path / "out.efw")
 
     def test_version_and_addresses_reach_the_tool(self, tmp_path):
-        tool = _fake_efwtool(tmp_path, 'echo "$@" > "$(dirname "$0")/argv.txt"\ntouch "$3"\n')
+        tool = _fake_efwtool(tmp_path, records_argv=True, writes_output=True)
         payload = tmp_path / "app"
         payload.write_bytes(b"x")
         pack(tool, payload, tmp_path / "out.efw", version="2.1.0",
@@ -113,7 +141,7 @@ class TestPack:
     def test_addresses_are_omitted_when_not_given(self, tmp_path):
         """A host build has no load address, and passing an empty one would
         make efwtool reject the call."""
-        tool = _fake_efwtool(tmp_path, 'echo "$@" > "$(dirname "$0")/argv.txt"\ntouch "$3"\n')
+        tool = _fake_efwtool(tmp_path, records_argv=True, writes_output=True)
         payload = tmp_path / "app"
         payload.write_bytes(b"x")
         pack(tool, payload, tmp_path / "out.efw")

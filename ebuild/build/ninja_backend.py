@@ -31,6 +31,16 @@ _PIC_FLAGS = {"-fPIC", "-fpic", "-fPIE", "-fpie", "-fno-pic", "-fno-PIC",
               "-fno-pie", "-fno-PIE"}
 
 
+def _exe_suffix() -> str:
+    """The extension the compiler driver gives an executable.
+
+    gcc on Windows appends .exe when -o names no extension, so an edge
+    declaring "app" produced "app.exe" on disk: ninja never saw its own
+    output, treated the target as dirty and relinked on every build.
+    """
+    return ".exe" if sys.platform == "win32" else ""
+
+
 def _shared_flag() -> str:
     """The flag that makes the compiler driver emit a shared object.
 
@@ -235,7 +245,8 @@ class NinjaBackend:
                             )
 
                 link_inputs = obj_files + dep_archives
-                out = escape_ninja_path(self.build_dir / target.name)
+                out = escape_ninja_path(
+                    self.build_dir / (target.name + _exe_suffix()))
                 lines.append(
                     f"build {out}: link " f"{' '.join(link_inputs)}"
                 )

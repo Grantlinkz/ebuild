@@ -25,6 +25,7 @@ An absolute --build-dir was already unambiguous, which is why it worked.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -123,7 +124,9 @@ def test_build_from_inside_project_is_unchanged(tmp_path, monkeypatch, record_ni
 
     assert result.exit_code == 0, result.output
     assert (tmp_path / "_build" / "build.ninja").is_file()
-    assert "Generated _build/build.ninja" in result.output
+    # The path is printed with the platform separator, so asserting the
+    # POSIX spelling failed on Windows against "Generated _build\\build.ninja".
+    assert f"Generated {os.path.join('_build', 'build.ninja')}" in result.output
 
 
 def test_absolute_build_dir_is_honoured_verbatim(outside_project, record_ninja, tmp_path):
@@ -255,4 +258,6 @@ def test_end_to_end_build_from_outside_produces_the_binary(tmp_path, monkeypatch
     )
 
     assert result.exit_code == 0, result.output
-    assert (project_dir / "_build" / "app").is_file()
+    # gcc appends .exe on Windows; the backend now names the edge to match.
+    exe = "app.exe" if os.name == "nt" else "app"
+    assert (project_dir / "_build" / exe).is_file()

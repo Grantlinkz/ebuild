@@ -14,6 +14,7 @@ the two tools disagree about what "flash" means:
     ram   = data + bss
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -57,7 +58,9 @@ class TestMeasure:
     def test_measures_a_real_binary(self, tmp_path):
         src = tmp_path / "m.c"
         src.write_text("static char buf[4096];\nint main(void){return buf[0];}\n")
-        exe = tmp_path / "m"
+        # gcc on Windows appends .exe when -o names no extension, so the
+        # path measured here has to carry it or there is nothing to measure.
+        exe = tmp_path / ("m.exe" if os.name == "nt" else "m")
         subprocess.run(["gcc", str(src), "-o", str(exe)], check=True)
 
         fp = measure(exe)
