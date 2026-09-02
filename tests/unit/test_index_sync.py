@@ -6,15 +6,19 @@
 import io
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from click.testing import CliRunner
 
+from ebuild.cli.commands import cli
 from ebuild.packages.index_sync import (
     DEFAULT_INDEX_URL,
+    MAX_INDEX_SIZE_BYTES,
     IndexSyncError,
     IndexSyncManager,
     get_default_index_dir,
@@ -57,6 +61,13 @@ def test_get_default_index_dir(monkeypatch, tmp_path):
     assert get_default_index_dir() == custom_dir
 
 
+def test_index_sync_missing_url(tmp_path):
+    """Verify Finding 3: Empty default URL raises IndexSyncError when no URL is given."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+    with pytest.raises(IndexSyncError, match="No remote package index URL configured"):
+        mgr.sync()
+
+
 def test_index_sync_insecure_url(tmp_path):
     mgr = IndexSyncManager(index_dir=tmp_path)
     with pytest.raises(IndexSyncError, match="Insecure index URL"):
@@ -86,11 +97,13 @@ def test_index_sync_success(tmp_path):
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
-        count, msg = mgr.sync(url="https://example.com/index.json")
+        res = mgr.sync(url="https://example.com/index.json", force=True)
 
-    assert count == 1
-    assert "Successfully synchronized 1 packages" in msg
+    assert res.count == 1
+    assert not res.is_fallback
+    assert "Successfully synchronized 1 packages" in res.message
     assert mgr.packages_json.is_file()
+    assert mgr.packages_json.with_suffix(".sha256").is_file()
 
     # Check that recipe YAML was cached
     recipe_file = mgr.recipes_dir / "mock-pkg.yaml"
@@ -110,7 +123,7 @@ def test_index_sync_corrupted_json(tmp_path):
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
         with pytest.raises(IndexSyncError, match="Corrupted or invalid JSON"):
-            mgr.sync()
+            mgr.sync(url="https://example.com/index.json")
 
 
 def test_index_sync_network_error_fallback(tmp_path):
@@ -122,10 +135,11 @@ def test_index_sync_network_error_fallback(tmp_path):
     mgr.packages_json.write_text(json.dumps(cached_data), encoding="utf-8")
 
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("No connection")):
-        count, msg = mgr.sync()
+        res = mgr.sync(url="https://example.com/index.json", force=True)
 
-    assert count == 1
-    assert "fell back to cached index" in msg
+    assert res.count == 1
+    assert res.is_fallback
+    assert "fell back to cached index" in res.message
 
 
 def test_index_sync_offline_mode(tmp_path):
@@ -135,6 +149,124 @@ def test_index_sync_offline_mode(tmp_path):
     cached_data = [{"name": "offline-lib", "version": "1.0.0"}]
     mgr.packages_json.write_text(json.dumps(cached_data), encoding="utf-8")
 
-    count, msg = mgr.sync(offline=True)
-    assert count == 1
-    assert "Offline mode" in msg
+    res = mgr.sync(offline=True)
+    assert res.count == 1
+    assert not res.is_fallback
+    assert "Offline mode" in res.message
+
+
+def test_index_sync_filters_unsafe_and_counts_accurately(tmp_path):
+    """Verify Findings 6 & 9a:
+    1. Cache filters unsafe package names and does not store them in packages.json.
+    2. synced_count only increments for packages where a recipe was actually written.
+    """
+    mgr = IndexSyncManager(index_dir=tmp_path)
+
+    sample_index = [
+        {
+            "name": "good-pkg",
+            "version": "1.0.0",
+            "url": "https://example.com/good.tar.gz",
+            "checksum": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        },
+        {
+            "name": "bad name!",
+            "version": "1.0.0",
+            "url": "https://example.com/bad.tar.gz",
+        },
+        {
+            "name": "urlless-pkg",
+            "version": "1.0.0",
+            "description": "No download URL",
+        },
+    ]
+    raw_json = json.dumps(sample_index).encode("utf-8")
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+
+    # Only good-pkg had a URL and passed validation -> 1 recipe written
+    assert res.count == 1
+    assert "Successfully synchronized 1 packages" in res.message
+
+    # Verify packages.json does not contain "bad name!"
+    cached_entries = json.loads(mgr.packages_json.read_text(encoding="utf-8"))
+    entry_names = [e["name"] for e in cached_entries]
+    assert "good-pkg" in entry_names
+    assert "urlless-pkg" in entry_names
+    assert "bad name!" not in entry_names
+
+    # Verify only good-pkg recipe file exists on disk
+    assert (mgr.recipes_dir / "good-pkg.yaml").is_file()
+    assert not (mgr.recipes_dir / "urlless-pkg.yaml").exists()
+
+
+def test_index_sync_force_and_staleness(tmp_path):
+    """Verify Finding 7: Cache freshness check skips network unless force=True."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+    mgr.ensure_directories()
+
+    cached_data = [{"name": "fresh-pkg", "version": "1.0.0"}]
+    mgr.packages_json.write_text(json.dumps(cached_data), encoding="utf-8")
+
+    with patch("urllib.request.urlopen") as mock_url:
+        # Fresh cache (< 24h) without force
+        res = mgr.sync(url="https://example.com/index.json", force=False)
+        assert res.count == 1
+        assert "Cache is up-to-date" in res.message
+        mock_url.assert_not_called()
+
+        # With force=True, urlopen must be called
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(cached_data).encode("utf-8")
+        mock_resp.headers = {}
+        mock_resp.__enter__.return_value = mock_resp
+        mock_url.return_value = mock_resp
+
+        res_forced = mgr.sync(url="https://example.com/index.json", force=True)
+        assert mock_url.called
+
+
+def test_index_sync_size_cap_and_lying_content_length(tmp_path):
+    """Verify max size cap handling."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+
+    # 1. Content-Length header is excessively large
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Content-Length": str(MAX_INDEX_SIZE_BYTES + 100)}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(IndexSyncError, match="exceeds maximum allowed size"):
+            mgr.sync(url="https://example.com/index.json", force=True)
+
+    # 2. Lying Content-Length: header claims small size, but stream exceeds limit
+    mock_resp2 = MagicMock()
+    mock_resp2.headers = {"Content-Length": "50"}
+    mock_resp2.read.return_value = b"x" * (MAX_INDEX_SIZE_BYTES + 2)
+    mock_resp2.__enter__.return_value = mock_resp2
+
+    with patch("urllib.request.urlopen", return_value=mock_resp2):
+        with pytest.raises(IndexSyncError, match="exceeded maximum size limit"):
+            mgr.sync(url="https://example.com/index.json", force=True)
+
+
+def test_cli_update_index_fallback_exits_nonzero(tmp_path, monkeypatch):
+    """Verify Finding 8: CLI update-index logs warning and exits 1 on fallback."""
+    custom_dir = tmp_path / "index_cache"
+    custom_dir.mkdir()
+    packages_json = custom_dir / "packages.json"
+    packages_json.write_text(json.dumps([{"name": "stale-pkg", "version": "1.0.0"}]), encoding="utf-8")
+    monkeypatch.setenv("EBUILD_INDEX_PATH", str(custom_dir))
+
+    runner = CliRunner()
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network down")):
+        # Without offline flag, network failure falling back to cache must exit non-zero
+        result = runner.invoke(cli, ["update-index", "--url", "https://example.com/index.json", "--force"])
+        assert result.exit_code == 1
+        assert "fell back to cached index" in result.output
