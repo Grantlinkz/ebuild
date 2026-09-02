@@ -166,7 +166,7 @@ class PackageRegistry:
         if version:
             return versions.get(version)
 
-        latest_version = sorted(versions.keys(), key=_version_sort_key)[-1]
+        latest_version = sorted(versions.keys(), key=version_sort_key)[-1]
         return versions[latest_version]
 
     def has(self, name: str, version: Optional[str] = None) -> bool:
@@ -178,7 +178,7 @@ class PackageRegistry:
         result = []
         for name in sorted(self._recipes.keys()):
             versions = self._recipes[name]
-            latest = sorted(versions.keys(), key=_version_sort_key)[-1]
+            latest = sorted(versions.keys(), key=version_sort_key)[-1]
             result.append(versions[latest])
         return result
 
@@ -189,7 +189,7 @@ class PackageRegistry:
                 versions[v]
                 for v in sorted(
                     versions.keys(),
-                    key=_version_sort_key,
+                    key=version_sort_key,
                  )
               ]
 

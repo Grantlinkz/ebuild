@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 EoS Project
 
@@ -9,6 +10,7 @@ pipeline, and hardware analysis commands.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
@@ -48,7 +50,7 @@ _RECIPE_DIRS = ["recipes"]
 
 
 def _find_recipe_dirs(project_dir: Path) -> List[Path]:
-    """Locate recipe directories: project-local and install-level."""
+    """Locate recipe directories: project-local, install-level, and remote synced cache."""
     dirs = []
     for name in _RECIPE_DIRS:
         d = project_dir / name
@@ -60,7 +62,14 @@ def _find_recipe_dirs(project_dir: Path) -> List[Path]:
     if pkg_recipes.is_dir() and pkg_recipes not in dirs:
         dirs.append(pkg_recipes)
 
+    # Also check remote synced cache in ~/.ebuild/index/recipes/
+    from ebuild.packages.index_sync import get_default_index_dir
+    cached_recipes = get_default_index_dir() / "recipes"
+    if cached_recipes.is_dir() and cached_recipes not in dirs:
+        dirs.append(cached_recipes)
+
     return dirs
+
 
 
 def _install_packages(
@@ -519,9 +528,16 @@ def _report_footprint(cfg: "ProjectConfig", build_path: Path, log: Logger) -> No
 
 
 def _board_config() -> Optional[Dict[str, Any]]:
-    """The project's own board description, if it ships one.
-
-    return resolved_backend, backend_config
+    """The project's own board description, if it ships one."""
+    path = Path("board.yaml")
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def _configure_ninja_backend(
@@ -852,7 +868,7 @@ def _generate_image(board, build_dir, log):
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose output.")
 @click.pass_context
 def cli(ctx: click.Context, verbose: bool) -> None:
-    """ebuild — A unified embedded OS build system."""
+    """ebuild - A unified embedded OS build system."""
     ctx.ensure_object(dict)
     ctx.obj = Logger(verbose=verbose)
 
@@ -1602,7 +1618,7 @@ def flash(log: Logger, image: str, tool: str, target: str, address: str,
 @click.pass_obj
 def list_packages(log: Logger, config_path: str) -> None:
     """List available package recipes and project packages."""
-    log.header("ebuild — Package Registry")
+    log.header("ebuild - Package Registry")
 
     config_path_obj = Path(config_path)
     project_dir = config_path_obj.parent if config_path_obj.exists() else Path(".")
@@ -1622,7 +1638,7 @@ def list_packages(log: Logger, config_path: str) -> None:
     log.info(f"Available recipes ({len(packages)}):")
     for recipe in packages:
         deps = f" (depends: {', '.join(recipe.dependencies)})" if recipe.dependencies else ""
-        desc = f" — {recipe.description}" if recipe.description else ""
+        desc = f" - {recipe.description}" if recipe.description else ""
         log.step(f"{recipe.name} v{recipe.version} [{recipe.build_system}]{deps}{desc}")
 
     # Show project packages if config exists
@@ -1637,6 +1653,81 @@ def list_packages(log: Logger, config_path: str) -> None:
                     log.step(f"{p.name}{ver} — {status}")
         except (ConfigError, FileNotFoundError):
             pass
+
+
+@cli.command("search")
+@click.argument("query", required=False, default="")
+@click.option("--all", "show_all", is_flag=True, default=False, help="Show all available packages.")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Output results in JSON format.")
+@click.option("--build-system", "build_sys", default=None, help="Filter by build system (cmake, make, meson, etc.).")
+@click.option("--license", "lic_filter", default=None, help="Filter by license.")
+@click.option(
+    "--config", "config_path",
+    default="build.yaml",
+    type=click.Path(exists=False),
+    help="Path to the build configuration file.",
+)
+@click.pass_obj
+def search_packages(
+    log: Logger,
+    query: str,
+    show_all: bool,
+    as_json: bool,
+    build_sys: Optional[str],
+    lic_filter: Optional[str],
+    config_path: str,
+) -> None:
+    """Search for packages across local recipes, shipped catalog, and remote index."""
+    from ebuild.packages.repository import PackageRepository
+
+    config_path_obj = Path(config_path)
+    project_dir = config_path_obj.parent if config_path_obj.exists() else Path(".")
+
+    repo = PackageRepository()
+    repo.load_all_sources(project_dir=project_dir)
+
+    effective_query = "" if show_all else query
+    results = repo.search(query=effective_query, build_system=build_sys, license=lic_filter)
+
+    if as_json:
+        import json
+        click.echo(json.dumps([pkg.to_dict() for pkg in results], indent=2))
+        return
+
+    log.header("ebuild - Package Search")
+    if not results:
+        if query:
+            log.info(f"No packages found matching '{query}'. Try running 'ebuild update-index' or 'ebuild search --all'.")
+        else:
+            log.info("No packages found. Try running 'ebuild update-index'.")
+        return
+
+    log.info(f"Found {len(results)} package(s):")
+    for pkg in results:
+        lic = f" ({pkg.license})" if pkg.license else ""
+        desc = f" - {pkg.description}" if pkg.description else ""
+        log.step(f"{pkg.name} v{pkg.version} [{pkg.build_system}]{lic}{desc}")
+
+
+@cli.command("update-index")
+@click.option("--url", "index_url", default=None, help="Custom remote package index URL (HTTPS).")
+@click.option("--offline", is_flag=True, default=False, help="Offline mode: do not download, use existing cache.")
+@click.option("--force", is_flag=True, default=False, help="Force refresh even if cache is up-to-date.")
+@click.pass_obj
+def update_index(log: Logger, index_url: Optional[str], offline: bool, force: bool) -> None:
+    """Synchronize the local package index with the remote recipe repository."""
+    from ebuild.packages.index_sync import IndexSyncManager, IndexSyncError
+
+    log.header("ebuild - Update Package Index")
+    sync_mgr = IndexSyncManager()
+
+    try:
+        count, msg = sync_mgr.sync(url=index_url, force=force, offline=offline)
+        log.success(msg)
+        log.info(f"Index cache located at: {sync_mgr.index_dir}")
+    except IndexSyncError as e:
+        log.error(f"Index update failed: {e}")
+        raise SystemExit(1)
 
 
 @cli.command()
@@ -2411,7 +2502,10 @@ def test(log: Logger, config_path: str, build_dir: str,
     log.info(" ".join(argv))
 
     try:
-        result = subprocess.run(argv, cwd=str(cwd))
+        # Captured rather than inherited, because the exit status alone cannot
+        # distinguish "every test passed" from "there were no tests". The
+        # output is echoed below so the terminal reads as it did before.
+        result = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
     except FileNotFoundError:
         log.error(
             f"{name} is not installed or not on PATH, so the tests cannot be "
@@ -2419,11 +2513,86 @@ def test(log: Logger, config_path: str, build_dir: str,
         )
         raise SystemExit(1)
 
+    output = (result.stdout or "") + (result.stderr or "")
+    if output:
+        click.echo(output.rstrip())
+
     if result.returncode != 0:
         log.error(f"Tests failed ({name} exited {result.returncode}).")
         raise SystemExit(result.returncode)
 
-    log.success("All tests passed.")
+    # ctest exits 0 when it finds nothing to run. A CMakeLists with
+    # enable_testing() and no add_test() produces a CTestTestfile.cmake, so the
+    # runner is found, ctest prints "No tests were found!!!", exits 0, and the
+    # only honest reading of that is not "All tests passed".
+    if _ran_no_tests(name, output):
+        log.error(f"{name} completed without running a single test.")
+        log.info("  A pass here would mean nothing; treating it as a failure.")
+        raise SystemExit(1)
+
+    counts = _parse_test_counts(name, output)
+    if counts is not None:
+        passed, failed = counts
+        log.success(f"All tests passed ({passed} passed, {failed} failed).")
+    else:
+        # No recognised summary. Report the verdict without inventing a number
+        # the runner did not print.
+        log.success("All tests passed.")
+
+
+#: What each runner prints when it completed having executed nothing. ctest's is
+#: the one that matters: it pairs the message with a zero exit status.
+_NO_TESTS_MARKERS = {
+    "ctest": ("No tests were found",),
+    "meson test": ("No tests defined",),
+    "cargo test": ("running 0 tests",),
+}
+
+#: Each runner's own summary line, anchored to the phrasing it prints so that a
+#: format change shows up as "no counts" rather than as a wrong number.
+_TEST_COUNT_PATTERNS = {
+    "ctest": re.compile(
+        r"tests passed,\s*(?P<failed>\d+)\s+tests? failed out of\s*(?P<total>\d+)"),
+    "meson test": re.compile(
+        r"^Ok:\s*(?P<passed>\d+).*?^Fail:\s*(?P<failed>\d+)", re.S | re.M),
+    "cargo test": re.compile(
+        r"test result:.*?(?P<passed>\d+) passed;\s*(?P<failed>\d+) failed"),
+}
+
+
+def _ran_no_tests(name: str, output: str) -> bool:
+    """True when the runner finished having executed nothing.
+
+    Checked two ways because neither is reliable alone: the marker phrase
+    catches ctest, which prints no summary at all in this case, and the counts
+    catch a runner that prints a well-formed summary totalling zero.
+    """
+    for marker in _NO_TESTS_MARKERS.get(name, ()):
+        if marker in output:
+            return True
+    counts = _parse_test_counts(name, output)
+    return counts is not None and counts[0] + counts[1] == 0
+
+
+def _parse_test_counts(name: str, output: str):
+    """(passed, failed) from the runner's own summary, or None.
+
+    `make test` has no standard summary format. Rather than invent one, its
+    counts stay unknown and the exit status carries the verdict.
+    """
+    pattern = _TEST_COUNT_PATTERNS.get(name)
+    if pattern is None:
+        return None
+    match = pattern.search(output)
+    if not match:
+        return None
+    groups = match.groupdict()
+    failed = int(groups["failed"])
+    if groups.get("passed") is not None:
+        return int(groups["passed"]), failed
+    # ctest reports failures out of a total; passed is the remainder.
+    return int(groups["total"]) - failed, failed
+
 
 
 def _run_native_tests(
