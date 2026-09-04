@@ -272,3 +272,74 @@ poles without thrashing; going much higher mostly adds memory pressure.
 Parallel builds also interleave package log lines. Output from each package is
 written atomically, but the packages themselves are no longer contiguous —
 use `-j 1` when reading a build log closely.
+
+---
+
+## Remote Package Index & Discovery
+
+ebuild provides index-based package discovery and remote recipe synchronization, allowing embedded projects to discover, query, and install external libraries seamlessly.
+
+### Discovering Packages (`ebuild search`)
+
+Search across local project recipes (`./recipes/`), bundled system recipes, and cached remote repository indices:
+
+```bash
+ebuild search json                 # Search by keyword in name, description, or license
+ebuild search --all                # List all available packages across all sources
+ebuild search --json               # Output machine-readable JSON array
+ebuild search --build-system cmake # Filter by build system (cmake, make, meson)
+ebuild search --license MIT        # Filter by license type
+```
+
+Example output:
+
+```
+=== ebuild - Package Search ===
+[info] Found 10 package(s):
+   cjson v1.7.18 [cmake] (MIT) - Ultralightweight JSON parser in ANSI C
+   freertos v11.1.0 [cmake] (MIT) - Real-time operating system kernel for embedded devices
+   littlefs v2.9.3 [make] (BSD-3-Clause) - Little fail-safe filesystem designed for microcontrollers
+   lvgl v9.2.2 [cmake] (MIT) - Light and Versatile Embedded Graphics Library
+   lwip v2.2.0 [cmake] (BSD-3-Clause) - Lightweight TCP/IP stack for embedded systems
+   mbedtls v3.6.0 [cmake] (Apache-2.0) - Lightweight TLS/SSL library for embedded systems
+   nanopb v0.4.9.1 [cmake] (zlib) - Protocol Buffers with small code size for microcontrollers
+   tinyusb v0.18.0 [cmake] (MIT) - Open-source cross-platform USB host/device stack for embedded system
+   unity v2.6.1 [cmake] (MIT) - Simple Unit Testing for C
+   zlib v1.3.1 [cmake] (Zlib) - General-purpose lossless data compression library
+```
+
+### Synchronizing Remote Index (`ebuild update-index`)
+
+Refresh the local package index and cached recipe definitions from the central remote repository or a custom mirror:
+
+```bash
+ebuild update-index                             # Sync from default upstream repository
+ebuild update-index --url https://mycorp.com/recipes/index.json  # Custom mirror
+ebuild update-index --force                     # Force refresh
+ebuild update-index --offline                   # Use local cached index without network
+```
+
+### Shipped Embedded Library Catalog
+
+ebuild includes a curated suite of pre-packaged recipes under `recipes/`:
+
+| Package | Version | Build System | License | Description |
+|:---|:---|:---|:---|:---|
+| **`cjson`** | 1.7.18 | CMake | MIT | Ultralightweight JSON parser in ANSI C |
+| **`freertos`** | 11.1.0 | CMake | MIT | Real-time operating system kernel for embedded devices |
+| **`littlefs`** | 2.9.3 | Make | BSD-3-Clause | Fail-safe power-resilient filesystem for microcontrollers |
+| **`lvgl`** | 9.2.2 | CMake | MIT | Light and Versatile Embedded Graphics Library |
+| **`lwip`** | 2.2.0 | CMake | BSD-3-Clause | Lightweight TCP/IP stack for embedded targets |
+| **`mbedtls`** | 3.6.0 | CMake | Apache-2.0 | Cryptographic primitives, TLS/SSL stack |
+| **`nanopb`** | 0.4.9.1 | CMake | zlib | Memory-efficient Protocol Buffers implementation |
+| **`tinyusb`** | 0.18.0 | CMake | MIT | Cross-platform USB host/device stack |
+| **`unity`** | 2.6.1 | CMake | MIT | Standard embedded C unit testing framework |
+| **`zlib`** | 1.3.1 | CMake | Zlib | General-purpose lossless data compression |
+
+### Offline & Air-Gapped Operation
+
+For isolated CI/CD pipelines and field deployments:
+- Set environment variable `EBUILD_OFFLINE=1` or pass `--offline` to commands.
+- ebuild automatically searches local directories first and gracefully falls back to cached indices in `~/.ebuild/index/` if the network is unreachable.
+- All downloads are validated against SHA-256 integrity pins before extraction.
+

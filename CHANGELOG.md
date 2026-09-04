@@ -2,7 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+- **Remote Package Index & Synchronization (`ebuild/packages/index_sync.py`).**
+  Downloads and validates central/mirror package repository indices into a local cache
+  (`~/.ebuild/index/`), caching full recipe definitions. Enforces HTTPS transport,
+  path-traversal sanitization (`^[a-zA-Z0-9_-]+$`), 10s socket timeouts, and 10MB response
+  size limits. Fully supports air-gapped/offline execution via `--offline` and `EBUILD_OFFLINE=1`.
+- **Package Discovery & Multi-Source Search (`ebuild search`, `ebuild/packages/repository.py`).**
+  Search across local project recipes, system-shipped recipes, and cached remote indices.
+  Supports `--all`, `--json`, `--build-system`, and `--license` filters.
+- **Index Synchronization Command (`ebuild update-index`).**
+  CLI command to refresh local package and recipe index caches from remote repositories.
+- **Expanded Shipped Recipes Catalog (`recipes/`).**
+  Added 5 verified recipes with HTTPS release pins and SHA-256 integrity digests:
+  `cjson` (v1.7.18), `nanopb` (v0.4.9.1), `lvgl` (v9.2.2), `tinyusb` (v0.18.0), and `unity` (v2.6.1).
+
 ### Fixed
+
 - **A path containing a space produced a silently wrong `build.ninja`.** Paths
   were written into build statements unescaped, but Ninja ends the output list
   at the first unescaped `:` and splits on unescaped spaces. A build directory
