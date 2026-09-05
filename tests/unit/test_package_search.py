@@ -38,11 +38,9 @@ build: cmake
     assert len(results) == 1
     assert results[0].name == "my_crypto"
 
-    # Search by license (both license_filter and backward-compatible license)
+    # Search by license filter
     assert len(repo.search("", license_filter="Apache")) == 1
-    assert len(repo.search("", license="Apache")) == 1
     assert len(repo.search("", license_filter="GPL")) == 0
-    assert len(repo.search("", license="GPL")) == 0
 
     # Search by build system
     assert len(repo.search("", build_system="cmake")) == 1
@@ -72,7 +70,7 @@ build: cmake
     remote_recipes.mkdir(parents=True)
     (remote_recipes / "cjson.yaml").write_text(
         """package: cjson
-version: "9.9.9"
+version: "1.7.18"
 description: "Remote cjson"
 url: "https://remote-registry.org/cjson-REMOTE.tar.gz"
 checksum: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -86,7 +84,7 @@ build: cmake
         json.dumps([
             {
                 "name": "cjson",
-                "version": "9.9.9",
+                "version": "1.7.18",
                 "url": "https://remote-registry.org/cjson-REMOTE.tar.gz",
                 "checksum": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
             }
@@ -94,6 +92,7 @@ build: cmake
         encoding="utf-8",
     )
 
+    # 1. Search path verification (PackageRepository)
     sync_mgr = IndexSyncManager(index_dir=remote_index_dir)
     repo = PackageRepository(sync_manager=sync_mgr)
     repo.load_all_sources(project_dir=proj_dir)
@@ -105,6 +104,17 @@ build: cmake
     assert pkg.url == "https://custom-project.org/cjson-PROJECT.tar.gz"
     assert pkg.checksum == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
     assert pkg.description == "Project pinned cjson"
+
+    # 2. Build path verification (_find_recipe_dirs + create_registry)
+    from ebuild.cli.commands import _find_recipe_dirs
+    from ebuild.packages.registry import create_registry
+
+    recipe_dirs = _find_recipe_dirs(proj_dir, remote_index_dir=remote_index_dir)
+    registry = create_registry(*recipe_dirs)
+    build_recipe = registry.get("cjson", "1.7.18")
+    assert build_recipe is not None
+    assert build_recipe.url == "https://custom-project.org/cjson-PROJECT.tar.gz"
+    assert build_recipe.checksum == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
 
 def test_cli_search_command(tmp_path):

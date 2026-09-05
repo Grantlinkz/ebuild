@@ -117,6 +117,7 @@ class IndexSyncManager:
         self.default_url = default_url
         self.packages_json = self.index_dir / "packages.json"
         self.recipes_dir = self.index_dir / "recipes"
+        self.meta_json = self.index_dir / "index-meta.json"
 
     def ensure_directories(self) -> None:
         """Create necessary index directories if they do not exist."""
@@ -170,8 +171,30 @@ class IndexSyncManager:
             count = len(cached)
             return SyncResult(count, f"Offline mode: using cached index ({count} packages)", is_fallback=False)
 
-        # Staleness check: if cache exists, is fresh (< 24h), and force=False, reuse cache without network
-        if not force and self.packages_json.is_file():
+        # First check target_url validity before using or validating against it
+        if not target_url:
+            raise IndexSyncError(
+                "No remote package index URL configured. Provide a repository URL with '--url <https://...>' until a default registry is published."
+            )
+
+        if not target_url.startswith("https://"):
+            raise IndexSyncError(
+                f"Insecure index URL '{target_url}': only HTTPS URLs are permitted."
+            )
+
+        # Staleness check: if cache exists, is fresh (< 24h), matches origin URL, and force=False
+        cached_meta: Dict[str, Any] = {}
+        if self.meta_json.is_file():
+            try:
+                with open(self.meta_json, "r", encoding="utf-8") as mf:
+                    cached_meta = json.load(mf)
+            except Exception:
+                cached_meta = {}
+
+        cached_url = cached_meta.get("url")
+        same_origin = (cached_url == target_url) if cached_url else (url is None)
+
+        if not force and same_origin and self.packages_json.is_file():
             try:
                 cache_age = time.time() - self.packages_json.stat().st_mtime
                 if cache_age < CACHE_TTL_SECONDS:
@@ -185,16 +208,6 @@ class IndexSyncManager:
             except OSError:
                 pass
 
-        if not target_url:
-            raise IndexSyncError(
-                "No remote package index URL configured. Provide a repository URL with '--url <https://...>' until a default registry is published."
-            )
-
-        if not target_url.startswith("https://"):
-            raise IndexSyncError(
-                f"Insecure index URL '{target_url}': only HTTPS URLs are permitted."
-            )
-
         logger.info("Fetching remote package index from %s", target_url)
 
         # 1. Network download with narrow exception handling
@@ -205,10 +218,16 @@ class IndexSyncManager:
             )
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 content_length = response.headers.get("Content-Length")
-                if content_length and int(content_length) > MAX_INDEX_SIZE_BYTES:
-                    raise IndexSyncError(
-                        f"Index download exceeds maximum allowed size ({MAX_INDEX_SIZE_BYTES} bytes)"
-                    )
+                if content_length:
+                    try:
+                        declared_length = int(str(content_length).strip())
+                        if declared_length > MAX_INDEX_SIZE_BYTES:
+                            raise IndexSyncError(
+                                f"Index download exceeds maximum allowed size ({MAX_INDEX_SIZE_BYTES} bytes)"
+                            )
+                    except ValueError:
+                        # Malformed header is advisory; bounded read below enforces size limit
+                        pass
                 raw_bytes = response.read(MAX_INDEX_SIZE_BYTES + 1)
                 if len(raw_bytes) > MAX_INDEX_SIZE_BYTES:
                     raise IndexSyncError(
@@ -237,13 +256,18 @@ class IndexSyncManager:
         if not isinstance(data, list):
             raise IndexSyncError("Invalid index schema: expected top-level JSON array")
 
-        # 3. Filter and sanitize entries in memory BEFORE caching to disk
+        # 3. Filter, sanitize, and deduplicate entries in memory BEFORE caching to disk
         valid_entries: List[Dict[str, Any]] = []
+        seen_names: set[str] = set()
         for entry in data:
             if not isinstance(entry, dict) or "name" not in entry:
                 continue
             try:
-                sanitize_package_name(str(entry["name"]))
+                pkg_name = sanitize_package_name(str(entry["name"]))
+                if pkg_name in seen_names:
+                    logger.warning("Discarding duplicate package entry in index: %s", pkg_name)
+                    continue
+                seen_names.add(pkg_name)
                 valid_entries.append(entry)
             except ValueError as ve:
                 logger.warning("Skipping unsafe package entry: %s", ve)
@@ -257,11 +281,24 @@ class IndexSyncManager:
 
         # 5. Record SHA-256 digest of the downloaded index for integrity visibility
         index_sha256 = hashlib.sha256(raw_bytes).hexdigest()
-        sha_file = self.packages_json.with_suffix(".sha256")
+        sha_file = self.packages_json.with_name(self.packages_json.name + ".sha256")
         temp_sha = sha_file.with_suffix(".tmp")
         with open(temp_sha, "w", encoding="utf-8") as sf:
             sf.write(f"{index_sha256}  packages.json\n")
         temp_sha.replace(sha_file)
+
+        # Write index metadata (origin URL, digest, sync time)
+        meta_data = {
+            "url": target_url,
+            "sha256": index_sha256,
+            "synced_at": time.time(),
+        }
+        temp_meta = self.meta_json.with_suffix(".tmp")
+        with open(temp_meta, "w", encoding="utf-8") as mf:
+            json.dump(meta_data, mf, indent=2)
+        temp_meta.replace(self.meta_json)
+
+        logger.info("Remote index SHA-256 digest: %s", index_sha256)
 
         # 6. Process and cache full recipe YAML definitions
         synced_count = 0

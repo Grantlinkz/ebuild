@@ -103,7 +103,8 @@ def test_index_sync_success(tmp_path):
     assert not res.is_fallback
     assert "Successfully synchronized 1 packages" in res.message
     assert mgr.packages_json.is_file()
-    assert mgr.packages_json.with_suffix(".sha256").is_file()
+    assert mgr.packages_json.with_name(mgr.packages_json.name + ".sha256").is_file()
+    assert mgr.meta_json.is_file()
 
     # Check that recipe YAML was cached
     recipe_file = mgr.recipes_dir / "mock-pkg.yaml"
@@ -207,33 +208,42 @@ def test_index_sync_filters_unsafe_and_counts_accurately(tmp_path):
 
 
 def test_index_sync_force_and_staleness(tmp_path):
-    """Verify Finding 7: Cache freshness check skips network unless force=True."""
+    """Verify Finding 2 & Finding 7: Cache freshness checks TTL and matches origin URL unless force=True."""
     mgr = IndexSyncManager(index_dir=tmp_path)
     mgr.ensure_directories()
 
-    cached_data = [{"name": "fresh-pkg", "version": "1.0.0"}]
+    cached_data = [{"name": "fresh-pkg", "version": "1.0.0", "url": "https://example.com/fresh.tar.gz"}]
     mgr.packages_json.write_text(json.dumps(cached_data), encoding="utf-8")
+    # Record metadata for index A
+    mgr.meta_json.write_text(json.dumps({"url": "https://a.example/index.json"}), encoding="utf-8")
 
     with patch("urllib.request.urlopen") as mock_url:
-        # Fresh cache (< 24h) without force
-        res = mgr.sync(url="https://example.com/index.json", force=False)
-        assert res.count == 1
-        assert "Cache is up-to-date" in res.message
-        mock_url.assert_not_called()
-
-        # With force=True, urlopen must be called
         mock_resp = MagicMock()
         mock_resp.read.return_value = json.dumps(cached_data).encode("utf-8")
         mock_resp.headers = {}
         mock_resp.__enter__.return_value = mock_resp
         mock_url.return_value = mock_resp
 
-        res_forced = mgr.sync(url="https://example.com/index.json", force=True)
+        # 1. Fresh cache (< 24h) from same URL without force -> reuses cache
+        res = mgr.sync(url="https://a.example/index.json", force=False)
+        assert res.count == 1
+        assert "Cache is up-to-date" in res.message
+        mock_url.assert_not_called()
+
+        # 2. Fresh cache (< 24h) but requested URL is DIFFERENT -> fetches new URL! (Finding 2)
+        res_diff_url = mgr.sync(url="https://b.example/index.json", force=False)
+        assert mock_url.called
+        assert res_diff_url.count == 1
+
+        mock_url.reset_mock()
+
+        # 3. With force=True, urlopen must be called even for same URL
+        res_forced = mgr.sync(url="https://b.example/index.json", force=True)
         assert mock_url.called
 
 
 def test_index_sync_size_cap_and_lying_content_length(tmp_path):
-    """Verify max size cap handling."""
+    """Verify max size cap and malformed Content-Length handling."""
     mgr = IndexSyncManager(index_dir=tmp_path)
 
     # 1. Content-Length header is excessively large
@@ -254,6 +264,47 @@ def test_index_sync_size_cap_and_lying_content_length(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp2):
         with pytest.raises(IndexSyncError, match="exceeded maximum size limit"):
             mgr.sync(url="https://example.com/index.json", force=True)
+
+    # 3. Malformed non-numeric Content-Length: does not raise ValueError (Finding 3)
+    valid_payload = json.dumps([{"name": "test-pkg", "url": "https://example.com/pkg.tar.gz"}]).encode("utf-8")
+    mock_resp3 = MagicMock()
+    mock_resp3.headers = {"Content-Length": "not-a-number"}
+    mock_resp3.read.return_value = valid_payload
+    mock_resp3.__enter__.return_value = mock_resp3
+
+    with patch("urllib.request.urlopen", return_value=mock_resp3):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+        assert res.count == 1
+
+
+def test_index_sync_deduplicates_duplicate_names(tmp_path):
+    """Verify Finding 6: Duplicate names in an index are deduplicated to avoid overwrites and over-reporting."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+
+    duplicate_index = [
+        {"name": "dup", "version": "1.0.0", "url": "https://example.com/dup1.tar.gz"},
+        {"name": "dup", "version": "9.9.9", "url": "https://example.com/dup9.tar.gz"},
+    ]
+    raw_json = json.dumps(duplicate_index).encode("utf-8")
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+
+    assert res.count == 1
+    assert "Successfully synchronized 1 packages" in res.message
+    # Verify recipes dir has only 1 file
+    recipe_files = list(mgr.recipes_dir.glob("*.yaml"))
+    assert len(recipe_files) == 1
+    assert recipe_files[0].name == "dup.yaml"
+
+    # Verify packages.json has only 1 entry
+    cached_entries = json.loads(mgr.packages_json.read_text(encoding="utf-8"))
+    assert len(cached_entries) == 1
 
 
 def test_cli_update_index_fallback_exits_nonzero(tmp_path, monkeypatch):

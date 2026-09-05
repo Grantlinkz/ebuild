@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ebuild.packages.index_sync import IndexSyncManager, get_default_index_dir, sanitize_package_name
-from ebuild.packages.registry import PackageRegistry, create_registry
+from ebuild.packages.registry import PackageRegistry, create_registry, find_recipe_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -144,23 +144,10 @@ class PackageRepository:
         Returns:
             Total count of packages indexed across all sources.
         """
-        # 1. Project-local recipes
-        if project_dir is not None:
-            p_dir = Path(project_dir)
-            if (p_dir / "recipes").is_dir():
-                self.add_recipe_directory(p_dir / "recipes")
+        for rdir in find_recipe_dirs(project_dir, remote_index_dir=self.sync_manager.index_dir):
+            self.add_recipe_directory(rdir)
 
-        # 2. Shipped system recipes
-        shipped_dir = Path(__file__).resolve().parent.parent.parent / "recipes"
-        if shipped_dir.is_dir():
-            self.add_recipe_directory(shipped_dir)
-
-        # 3. Cached remote recipes
-        for rdir in self.sync_manager.get_recipe_dirs():
-            if rdir.is_dir() and rdir != shipped_dir:
-                self.add_recipe_directory(rdir)
-
-        # 4. Cached remote JSON index
+        # Cached remote JSON index
         if self.sync_manager.packages_json.is_file():
             self.load_index(self.sync_manager.packages_json)
 
@@ -171,7 +158,6 @@ class PackageRepository:
         query: str = "",
         build_system: Optional[str] = None,
         license_filter: Optional[str] = None,
-        license: Optional[str] = None,
     ) -> List[PackageInfo]:
         """Search for packages matching query and filters.
 
@@ -179,12 +165,11 @@ class PackageRepository:
             query: Search query string (matches name, description, license).
             build_system: Optional build system filter (e.g., 'cmake', 'make').
             license_filter: Optional license filter.
-            license: Backward-compatible alias for license_filter.
 
         Returns:
             List of matching PackageInfo objects sorted by name.
         """
-        effective_lic = license_filter or license
+        effective_lic = license_filter
         query_lower = query.strip().lower()
         results = []
 

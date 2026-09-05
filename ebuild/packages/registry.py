@@ -123,10 +123,11 @@ class PackageRegistry:
         return count
 
     def _register(self, recipe: PackageRecipe) -> None:
-        """Register a recipe in the internal index."""
+        """Register a recipe in the internal index (first-registered wins)."""
         if recipe.name not in self._recipes:
             self._recipes[recipe.name] = {}
-        self._recipes[recipe.name][recipe.version] = recipe
+        if recipe.version not in self._recipes[recipe.name]:
+            self._recipes[recipe.name][recipe.version] = recipe
 
     def get(self, name: str, version: Optional[str] = None) -> Optional[PackageRecipe]:
         """Look up a package recipe by name and optional version.
@@ -187,3 +188,43 @@ def create_registry(*recipe_dirs: str | Path) -> PackageRegistry:
         registry.add_search_path(d)
     registry.scan()
     return registry
+
+
+def find_recipe_dirs(
+    project_dir: Optional[Path | str] = None,
+    remote_index_dir: Optional[Path | str] = None,
+) -> List[Path]:
+    """Locate recipe directories in priority order: project-local, install-level, and remote synced cache.
+
+    Args:
+        project_dir: Optional path to project root.
+        remote_index_dir: Optional custom remote index cache directory.
+
+    Returns:
+        List of existing recipe directory Paths in priority order.
+    """
+    dirs: List[Path] = []
+    if project_dir is not None:
+        p_dir = Path(project_dir)
+        local_recipes = p_dir / "recipes"
+        if local_recipes.is_dir():
+            dirs.append(local_recipes)
+
+    # Shipped system recipes
+    pkg_recipes = Path(__file__).resolve().parent.parent.parent / "recipes"
+    if pkg_recipes.is_dir() and pkg_recipes not in dirs:
+        dirs.append(pkg_recipes)
+
+    # Remote synced cache in ~/.ebuild/index/recipes/ (or custom index_dir)
+    try:
+        if remote_index_dir is not None:
+            cached_recipes = Path(remote_index_dir) / "recipes"
+        else:
+            from ebuild.packages.index_sync import get_default_index_dir
+            cached_recipes = get_default_index_dir() / "recipes"
+        if cached_recipes.is_dir() and cached_recipes not in dirs:
+            dirs.append(cached_recipes)
+    except Exception:
+        pass
+
+    return dirs

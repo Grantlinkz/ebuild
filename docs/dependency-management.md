@@ -356,7 +356,8 @@ ebuild includes a curated suite of pre-packaged recipes under `recipes/`:
 ### Offline & Air-Gapped Operation
 
 For isolated CI/CD pipelines and field deployments:
-- Set environment variable `EBUILD_OFFLINE=1` or pass `--offline` to commands.
+- Set environment variable `EBUILD_OFFLINE=1` or pass `--offline` to `ebuild update-index` to use cached remote indices without attempting network synchronization.
+- Note: Package archive source fetching (`ebuild build`) currently verifies archive integrity against pinned SHA-256 checksums but is not yet gated by the `--offline` flag.
 - ebuild automatically searches local directories first and gracefully falls back to cached indices in `~/.ebuild/index/` if the network is unreachable.
 - All downloads are validated against SHA-256 integrity pins before extraction.
 

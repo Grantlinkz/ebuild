@@ -38,36 +38,14 @@ from ebuild.packages.cache import PackageCache
 from ebuild.packages.fetcher import FetchError, PackageFetcher
 from ebuild.packages.lockfile import Lockfile
 from ebuild.packages.recipe import RecipeError
-from ebuild.packages.registry import create_registry
+from ebuild.packages.registry import create_registry, find_recipe_dirs
 from ebuild.packages.resolver import PackageResolver, ResolveError
 
 
 pass_logger = click.make_pass_decorator(Logger, ensure=True)
 
-# Default recipe search paths (relative to project root)
-_RECIPE_DIRS = ["recipes"]
-
-
-def _find_recipe_dirs(project_dir: Path) -> List[Path]:
-    """Locate recipe directories: project-local, install-level, and remote synced cache."""
-    dirs = []
-    for name in _RECIPE_DIRS:
-        d = project_dir / name
-        if d.is_dir():
-            dirs.append(d)
-
-    # Also check ebuild install location
-    pkg_recipes = Path(__file__).resolve().parent.parent.parent / "recipes"
-    if pkg_recipes.is_dir() and pkg_recipes not in dirs:
-        dirs.append(pkg_recipes)
-
-    # Also check remote synced cache in ~/.ebuild/index/recipes/
-    from ebuild.packages.index_sync import get_default_index_dir
-    cached_recipes = get_default_index_dir() / "recipes"
-    if cached_recipes.is_dir() and cached_recipes not in dirs:
-        dirs.append(cached_recipes)
-
-    return dirs
+# Canonical recipe search path discovery
+_find_recipe_dirs = find_recipe_dirs
 
 
 
