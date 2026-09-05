@@ -38,13 +38,73 @@ build: cmake
     assert len(results) == 1
     assert results[0].name == "my_crypto"
 
-    # Search by license
+    # Search by license (both license_filter and backward-compatible license)
+    assert len(repo.search("", license_filter="Apache")) == 1
     assert len(repo.search("", license="Apache")) == 1
+    assert len(repo.search("", license_filter="GPL")) == 0
     assert len(repo.search("", license="GPL")) == 0
 
     # Search by build system
     assert len(repo.search("", build_system="cmake")) == 1
     assert len(repo.search("", build_system="meson")) == 0
+
+
+def test_package_source_precedence_project_wins(tmp_path):
+    """Verify Finding 1: Project-local recipe takes precedence over shipped and cached remote recipes."""
+    # 1. Create project-local recipe
+    proj_dir = tmp_path / "project"
+    proj_recipes = proj_dir / "recipes"
+    proj_recipes.mkdir(parents=True)
+    (proj_recipes / "cjson.yaml").write_text(
+        """package: cjson
+version: "1.7.18"
+description: "Project pinned cjson"
+url: "https://custom-project.org/cjson-PROJECT.tar.gz"
+checksum: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+build: cmake
+""",
+        encoding="utf-8",
+    )
+
+    # 2. Create remote cached index with a different URL and checksum for cjson
+    remote_index_dir = tmp_path / "remote_index"
+    remote_recipes = remote_index_dir / "recipes"
+    remote_recipes.mkdir(parents=True)
+    (remote_recipes / "cjson.yaml").write_text(
+        """package: cjson
+version: "9.9.9"
+description: "Remote cjson"
+url: "https://remote-registry.org/cjson-REMOTE.tar.gz"
+checksum: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+build: cmake
+""",
+        encoding="utf-8",
+    )
+    # Also in packages.json
+    packages_json = remote_index_dir / "packages.json"
+    packages_json.write_text(
+        json.dumps([
+            {
+                "name": "cjson",
+                "version": "9.9.9",
+                "url": "https://remote-registry.org/cjson-REMOTE.tar.gz",
+                "checksum": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+            }
+        ]),
+        encoding="utf-8",
+    )
+
+    sync_mgr = IndexSyncManager(index_dir=remote_index_dir)
+    repo = PackageRepository(sync_manager=sync_mgr)
+    repo.load_all_sources(project_dir=proj_dir)
+
+    pkg = repo.info("cjson")
+    assert pkg is not None
+    # Must resolve to the PROJECT-local version, url, and checksum!
+    assert pkg.version == "1.7.18"
+    assert pkg.url == "https://custom-project.org/cjson-PROJECT.tar.gz"
+    assert pkg.checksum == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    assert pkg.description == "Project pinned cjson"
 
 
 def test_cli_search_command(tmp_path):
@@ -67,3 +127,4 @@ def test_cli_update_index_offline():
     result = runner.invoke(cli, ["update-index", "--offline"])
     assert result.exit_code == 0
     assert "Offline mode" in result.output
+

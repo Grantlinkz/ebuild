@@ -15,7 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ebuild.packages.index_sync import IndexSyncManager, get_default_index_dir
+from ebuild.packages.index_sync import IndexSyncManager, get_default_index_dir, sanitize_package_name
 from ebuild.packages.registry import PackageRegistry, create_registry
 
 logger = logging.getLogger(__name__)
@@ -75,8 +75,10 @@ class PackageRepository:
                 url=recipe.url,
                 checksum=recipe.checksum,
             )
-            self._index[recipe.name] = info
-            count += 1
+            # Local/earlier recipe directory overrides later directories if already loaded
+            if recipe.name not in self._index:
+                self._index[recipe.name] = info
+                count += 1
 
         return count
 
@@ -112,7 +114,10 @@ class PackageRepository:
         for entry in data:
             if not isinstance(entry, dict) or "name" not in entry:
                 continue
-            name = str(entry["name"])
+            try:
+                name = sanitize_package_name(str(entry["name"]))
+            except ValueError:
+                continue
             info = PackageInfo(
                 name=name,
                 version=str(entry.get("version", "0.0.0")),
@@ -165,6 +170,7 @@ class PackageRepository:
         self,
         query: str = "",
         build_system: Optional[str] = None,
+        license_filter: Optional[str] = None,
         license: Optional[str] = None,
     ) -> List[PackageInfo]:
         """Search for packages matching query and filters.
@@ -172,11 +178,13 @@ class PackageRepository:
         Args:
             query: Search query string (matches name, description, license).
             build_system: Optional build system filter (e.g., 'cmake', 'make').
-            license: Optional license filter.
+            license_filter: Optional license filter.
+            license: Backward-compatible alias for license_filter.
 
         Returns:
             List of matching PackageInfo objects sorted by name.
         """
+        effective_lic = license_filter or license
         query_lower = query.strip().lower()
         results = []
 
@@ -191,7 +199,7 @@ class PackageRepository:
             if build_system and info.build_system.lower() != build_system.strip().lower():
                 continue
 
-            if license and license.strip().lower() not in info.license.lower():
+            if effective_lic and effective_lic.strip().lower() not in info.license.lower():
                 continue
 
             results.append(info)

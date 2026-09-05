@@ -1712,7 +1712,7 @@ def search_packages(
     repo.load_all_sources(project_dir=project_dir)
 
     effective_query = "" if show_all else query
-    results = repo.search(query=effective_query, build_system=build_sys, license=lic_filter)
+    results = repo.search(query=effective_query, build_system=build_sys, license_filter=lic_filter)
 
     if as_json:
         import json

@@ -310,14 +310,31 @@ Example output:
 
 ### Synchronizing Remote Index (`ebuild update-index`)
 
-Refresh the local package index and cached recipe definitions from the central remote repository or a custom mirror:
+Refresh the local package index and cached recipe definitions from a remote repository mirror:
 
 ```bash
-ebuild update-index                             # Sync from default upstream repository
-ebuild update-index --url https://mycorp.com/recipes/index.json  # Custom mirror
-ebuild update-index --force                     # Force refresh
+ebuild update-index --url https://example.com/recipes/index.json  # Remote repository URL (HTTPS required)
+ebuild update-index --url https://example.com/recipes/index.json --force  # Bypass 24h cache TTL and re-download
 ebuild update-index --offline                   # Use local cached index without network
 ```
+
+> [!WARNING]
+> **Index Authenticity & Provenance Notice (Unauthenticated Index)**:
+> Remote package index synchronization validates transport encryption (HTTPS only) and verifies individual package archive bytes against stated SHA-256 checksums. However, the index document itself is currently **unauthenticated** (detached cryptographic signature verification and package provenance proof are not yet implemented).
+>
+> In accordance with reproducible build guarantees (§9.2), project-local recipes in `./recipes/` take absolute precedence over remote index definitions. An index update will never override pinned URLs or checksums defined in your project repository.
+>
+> To support integrity verification, the SHA-256 digest of the downloaded index is recorded in `~/.ebuild/index/packages.json.sha256`.
+
+### Component Contract (§10.1) Field Coverage
+
+eBuild recipes currently carry a subset of the Master Design §10.1 component contract:
+- **Identity**: Package name, version, and optional description.
+- **Dependencies**: List of external library package dependencies.
+- **Compliance**: Package open-source license identifier.
+- **Integrity**: Transport SHA-256 checksum pin for downloaded tarballs.
+
+*Deferred Contract Fields*: Compatibility constraints (EmbeddedOS ABI/API version, architecture, and SoC targets) and Resource constraints (`flash_max`, `ram_max`) are not yet evaluated by the registry layer and must be validated at project build configuration time.
 
 ### Shipped Embedded Library Catalog
 
@@ -342,4 +359,5 @@ For isolated CI/CD pipelines and field deployments:
 - Set environment variable `EBUILD_OFFLINE=1` or pass `--offline` to commands.
 - ebuild automatically searches local directories first and gracefully falls back to cached indices in `~/.ebuild/index/` if the network is unreachable.
 - All downloads are validated against SHA-256 integrity pins before extraction.
+
 

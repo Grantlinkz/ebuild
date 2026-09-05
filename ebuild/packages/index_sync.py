@@ -15,22 +15,20 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from ebuild.packages.recipe import PackageRecipe, RecipeError, _parse_recipe
+from ebuild.packages.recipe import PackageRecipe, RecipeError, parse_recipe
 
 logger = logging.getLogger(__name__)
 
-# Default remote repository index URL
-DEFAULT_INDEX_URL = (
-    "https://raw.githubusercontent.com/embeddedos-org/recipes/main/index.json"
-)
+# Default remote repository index URL (empty until official registry repository is published)
+DEFAULT_INDEX_URL = ""
 
 # Maximum response size allowed for index download (10 MB)
 MAX_INDEX_SIZE_BYTES = 10 * 1024 * 1024
@@ -38,12 +36,33 @@ MAX_INDEX_SIZE_BYTES = 10 * 1024 * 1024
 # Network timeout in seconds
 DEFAULT_NETWORK_TIMEOUT_SECONDS = 10
 
+# Cache TTL in seconds (24 hours) for freshness check
+CACHE_TTL_SECONDS = 86400
+
 # Valid package name pattern (strict validation to prevent path traversal)
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 class IndexSyncError(Exception):
     """Raised when index synchronization fails and cannot fallback."""
+
+
+class SyncResult(Tuple[int, str]):
+    """Result of index synchronization, preserving tuple unpacking (count, message)."""
+
+    count: int
+    message: str
+    is_fallback: bool
+
+    def __new__(cls, count: int, message: str, is_fallback: bool = False) -> SyncResult:
+        obj = super().__new__(cls, (count, message))
+        obj.count = count
+        obj.message = message
+        obj.is_fallback = is_fallback
+        return obj
+
+    def __repr__(self) -> str:
+        return f"SyncResult(count={self.count}, message={self.message!r}, is_fallback={self.is_fallback})"
 
 
 def is_offline(offline_flag: bool = False) -> bool:
@@ -130,7 +149,7 @@ class IndexSyncManager:
         force: bool = False,
         offline: bool = False,
         timeout: int = DEFAULT_NETWORK_TIMEOUT_SECONDS,
-    ) -> Tuple[int, str]:
+    ) -> SyncResult:
         """Synchronize the index from the remote URL to the local cache.
 
         Args:
@@ -140,15 +159,36 @@ class IndexSyncManager:
             timeout: Network timeout in seconds.
 
         Returns:
-            Tuple of (package_count, status_message).
+            SyncResult of (package_count, status_message, is_fallback).
         """
         target_url = (url or self.default_url).strip()
         self.ensure_directories()
 
+        # Offline mode
         if is_offline(offline):
             cached = self.load_cached_entries()
             count = len(cached)
-            return count, f"Offline mode: using cached index ({count} packages)"
+            return SyncResult(count, f"Offline mode: using cached index ({count} packages)", is_fallback=False)
+
+        # Staleness check: if cache exists, is fresh (< 24h), and force=False, reuse cache without network
+        if not force and self.packages_json.is_file():
+            try:
+                cache_age = time.time() - self.packages_json.stat().st_mtime
+                if cache_age < CACHE_TTL_SECONDS:
+                    cached = self.load_cached_entries()
+                    count = len(cached)
+                    return SyncResult(
+                        count,
+                        f"Cache is up-to-date (synced recently). Use --force to re-download. ({count} packages)",
+                        is_fallback=False,
+                    )
+            except OSError:
+                pass
+
+        if not target_url:
+            raise IndexSyncError(
+                "No remote package index URL configured. Provide a repository URL with '--url <https://...>' until a default registry is published."
+            )
 
         if not target_url.startswith("https://"):
             raise IndexSyncError(
@@ -157,6 +197,7 @@ class IndexSyncManager:
 
         logger.info("Fetching remote package index from %s", target_url)
 
+        # 1. Network download with narrow exception handling
         try:
             req = urllib.request.Request(
                 target_url,
@@ -173,68 +214,89 @@ class IndexSyncManager:
                     raise IndexSyncError(
                         f"Index download exceeded maximum size limit of {MAX_INDEX_SIZE_BYTES} bytes"
                     )
-
-            # Parse JSON
-            try:
-                data = json.loads(raw_bytes.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError) as err:
-                raise IndexSyncError(f"Corrupted or invalid JSON index from {target_url}: {err}") from err
-
-            if not isinstance(data, list):
-                raise IndexSyncError("Invalid index schema: expected top-level JSON array")
-
-            # Write cached packages.json atomically
-            temp_json = self.packages_json.with_suffix(".tmp")
-            with open(temp_json, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            temp_json.replace(self.packages_json)
-
-            # Process and cache full recipe YAML definitions
-            synced_count = 0
-            for entry in data:
-                if not isinstance(entry, dict) or "name" not in entry:
-                    continue
-                try:
-                    pkg_name = sanitize_package_name(str(entry["name"]))
-                    recipe_filename = f"{pkg_name}.yaml"
-                    recipe_path = self.recipes_dir / recipe_filename
-
-                    # Write recipe YAML if entry contains recipe attributes
-                    recipe_dict = {
-                        "package": pkg_name,
-                        "version": str(entry.get("version", "1.0.0")),
-                        "description": entry.get("description", ""),
-                        "license": entry.get("license", ""),
-                        "url": entry.get("url", ""),
-                        "checksum": entry.get("checksum", ""),
-                        "build": entry.get("build_system", entry.get("build", "cmake")),
-                        "dependencies": entry.get("dependencies", []),
-                        "configure_args": entry.get("configure_args", []),
-                        "build_args": entry.get("build_args", []),
-                        "patches": entry.get("patches", []),
-                    }
-
-                    # If URL exists, validate recipe structure before saving
-                    if recipe_dict["url"]:
-                        try:
-                            recipe = _parse_recipe(recipe_dict)
-                            with open(recipe_path, "w", encoding="utf-8") as rf:
-                                yaml.safe_dump(recipe_dict, rf, sort_keys=False)
-                        except RecipeError as re_err:
-                            logger.warning("Skipping invalid recipe entry %s: %s", pkg_name, re_err)
-                            continue
-
-                    synced_count += 1
-                except ValueError as ve:
-                    logger.warning("Skipping unsafe package entry: %s", ve)
-                    continue
-
-            return synced_count, f"Successfully synchronized {synced_count} packages from remote index"
-
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as e:
-            # Fallback to local cache if available
+        except IndexSyncError:
+            raise
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+            # Fallback to local cache if available on network error
             cached = self.load_cached_entries()
             if cached:
                 logger.warning("Remote sync failed (%s). Falling back to cached index.", e)
-                return len(cached), f"Network sync failed ({e}); fell back to cached index ({len(cached)} packages)"
+                return SyncResult(
+                    len(cached),
+                    f"Network sync failed ({e}); fell back to cached index ({len(cached)} packages)",
+                    is_fallback=True,
+                )
             raise IndexSyncError(f"Failed to fetch remote package index and no cache is available: {e}") from e
+
+        # 2. Parse and validate JSON index
+        try:
+            data = json.loads(raw_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as err:
+            raise IndexSyncError(f"Corrupted or invalid JSON index from {target_url}: {err}") from err
+
+        if not isinstance(data, list):
+            raise IndexSyncError("Invalid index schema: expected top-level JSON array")
+
+        # 3. Filter and sanitize entries in memory BEFORE caching to disk
+        valid_entries: List[Dict[str, Any]] = []
+        for entry in data:
+            if not isinstance(entry, dict) or "name" not in entry:
+                continue
+            try:
+                sanitize_package_name(str(entry["name"]))
+                valid_entries.append(entry)
+            except ValueError as ve:
+                logger.warning("Skipping unsafe package entry: %s", ve)
+                continue
+
+        # 4. Write cached packages.json atomically with sanitized entries only
+        temp_json = self.packages_json.with_suffix(".tmp")
+        with open(temp_json, "w", encoding="utf-8") as f:
+            json.dump(valid_entries, f, indent=2)
+        temp_json.replace(self.packages_json)
+
+        # 5. Record SHA-256 digest of the downloaded index for integrity visibility
+        index_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        sha_file = self.packages_json.with_suffix(".sha256")
+        temp_sha = sha_file.with_suffix(".tmp")
+        with open(temp_sha, "w", encoding="utf-8") as sf:
+            sf.write(f"{index_sha256}  packages.json\n")
+        temp_sha.replace(sha_file)
+
+        # 6. Process and cache full recipe YAML definitions
+        synced_count = 0
+        for entry in valid_entries:
+            pkg_name = sanitize_package_name(str(entry["name"]))
+            recipe_filename = f"{pkg_name}.yaml"
+            recipe_path = self.recipes_dir / recipe_filename
+
+            recipe_dict = {
+                "package": pkg_name,
+                "version": str(entry.get("version", "1.0.0")),
+                "description": entry.get("description", ""),
+                "license": entry.get("license", ""),
+                "url": entry.get("url", ""),
+                "checksum": entry.get("checksum", ""),
+                "build": entry.get("build_system", entry.get("build", "cmake")),
+                "dependencies": entry.get("dependencies", []),
+                "configure_args": entry.get("configure_args", []),
+                "build_args": entry.get("build_args", []),
+                "patches": entry.get("patches", []),
+            }
+
+            # Only write recipe file if entry provides a download URL
+            if recipe_dict["url"]:
+                try:
+                    recipe = parse_recipe(recipe_dict)
+                    with open(recipe_path, "w", encoding="utf-8") as rf:
+                        yaml.safe_dump(recipe.to_dict(), rf, sort_keys=False)
+                    synced_count += 1
+                except (RecipeError, ValueError) as re_err:
+                    logger.warning("Skipping invalid recipe entry %s: %s", pkg_name, re_err)
+                    continue
+
+        return SyncResult(
+            synced_count,
+            f"Successfully synchronized {synced_count} packages from remote index",
+            is_fallback=False,
+        )
