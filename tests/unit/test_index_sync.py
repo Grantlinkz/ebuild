@@ -321,3 +321,64 @@ def test_cli_update_index_fallback_exits_nonzero(tmp_path, monkeypatch):
         result = runner.invoke(cli, ["update-index", "--url", "https://example.com/index.json", "--force"])
         assert result.exit_code == 1
         assert "fell back to cached index" in result.output
+
+
+def test_index_sync_prunes_stale_cached_recipes(tmp_path):
+    """Verify Finding 5: Cached recipe YAMLs not present in new index are pruned."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+
+    # First sync: index containing 'alpha'
+    index_a = [
+        {"name": "alpha", "version": "1.0.0", "url": "https://example.com/alpha.tar.gz"},
+    ]
+    raw_a = json.dumps(index_a).encode("utf-8")
+    mock_resp_a = MagicMock()
+    mock_resp_a.read.return_value = raw_a
+    mock_resp_a.headers = {"Content-Length": str(len(raw_a))}
+    mock_resp_a.__enter__.return_value = mock_resp_a
+
+    with patch("urllib.request.urlopen", return_value=mock_resp_a):
+        res_a = mgr.sync(url="https://example.com/index-a.json", force=True)
+        assert res_a.count == 1
+
+    recipe_files_a = sorted([f.name for f in mgr.recipes_dir.glob("*.yaml")])
+    assert recipe_files_a == ["alpha.yaml"]
+
+    # Second sync: index containing 'beta' (alpha withdrawn/absent)
+    index_b = [
+        {"name": "beta", "version": "2.0.0", "url": "https://example.com/beta.tar.gz"},
+    ]
+    raw_b = json.dumps(index_b).encode("utf-8")
+    mock_resp_b = MagicMock()
+    mock_resp_b.read.return_value = raw_b
+    mock_resp_b.headers = {"Content-Length": str(len(raw_b))}
+    mock_resp_b.__enter__.return_value = mock_resp_b
+
+    with patch("urllib.request.urlopen", return_value=mock_resp_b):
+        res_b = mgr.sync(url="https://example.com/index-b.json", force=True)
+        assert res_b.count == 1
+
+    recipe_files_b = sorted([f.name for f in mgr.recipes_dir.glob("*.yaml")])
+    # alpha.yaml must be pruned; only beta.yaml must remain!
+    assert recipe_files_b == ["beta.yaml"]
+
+
+def test_cli_update_index_reports_sha256_digest(tmp_path, monkeypatch):
+    """Verify Finding 6: CLI update-index surfaces the SHA-256 digest and updates."""
+    custom_dir = tmp_path / "index_cache"
+    monkeypatch.setenv("EBUILD_INDEX_PATH", str(custom_dir))
+
+    index_data = [
+        {"name": "gamma", "version": "1.0.0", "url": "https://example.com/gamma.tar.gz"},
+    ]
+    raw_json = json.dumps(index_data).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    runner = CliRunner()
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        result = runner.invoke(cli, ["update-index", "--url", "https://example.com/index.json", "--force"])
+        assert result.exit_code == 0
+        assert "Index SHA-256 digest:" in result.output

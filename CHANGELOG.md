@@ -7,7 +7,7 @@
   Downloads and validates central/mirror package repository indices into a local cache
   (`~/.ebuild/index/`), caching full recipe definitions. Enforces HTTPS transport,
   path-traversal sanitization (`^[a-zA-Z0-9_-]+$`), 10s socket timeouts, and 10MB response
-  size limits. Fully supports air-gapped/offline execution via `--offline` and `EBUILD_OFFLINE=1`.
+  size limits. Index synchronization supports air-gapped operation via `--offline` and `EBUILD_OFFLINE=1`; package archive fetching is not yet offline-gated.
 - **Package Discovery & Multi-Source Search (`ebuild search`, `ebuild/packages/repository.py`).**
   Search across local project recipes, system-shipped recipes, and cached remote indices.
   Supports `--all`, `--json`, `--build-system`, and `--license` filters.

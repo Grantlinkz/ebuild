@@ -64,13 +64,13 @@ build: cmake
         encoding="utf-8",
     )
 
-    # 2. Create remote cached index with a different URL and checksum for cjson
+    # 2. Create remote cached index with a higher version (9.9.9) for cjson
     remote_index_dir = tmp_path / "remote_index"
     remote_recipes = remote_index_dir / "recipes"
     remote_recipes.mkdir(parents=True)
     (remote_recipes / "cjson.yaml").write_text(
         """package: cjson
-version: "1.7.18"
+version: "9.9.9"
 description: "Remote cjson"
 url: "https://remote-registry.org/cjson-REMOTE.tar.gz"
 checksum: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -84,7 +84,7 @@ build: cmake
         json.dumps([
             {
                 "name": "cjson",
-                "version": "1.7.18",
+                "version": "9.9.9",
                 "url": "https://remote-registry.org/cjson-REMOTE.tar.gz",
                 "checksum": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
             }
@@ -111,10 +111,78 @@ build: cmake
 
     recipe_dirs = _find_recipe_dirs(proj_dir, remote_index_dir=remote_index_dir)
     registry = create_registry(*recipe_dirs)
+
+    # Explicit version lookup
     build_recipe = registry.get("cjson", "1.7.18")
     assert build_recipe is not None
     assert build_recipe.url == "https://custom-project.org/cjson-PROJECT.tar.gz"
     assert build_recipe.checksum == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+    # Unpinned version lookup: project-local recipe must win over higher remote version!
+    unpinned_recipe = registry.get("cjson")
+    assert unpinned_recipe is not None
+    assert unpinned_recipe.version == "1.7.18"
+    assert unpinned_recipe.url == "https://custom-project.org/cjson-PROJECT.tar.gz"
+    assert unpinned_recipe.checksum == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+
+def test_transitive_dependency_source_precedence_project_wins(tmp_path):
+    """Verify Finding 1: Transitive dependencies resolve to project-local definitions even when remote has higher version."""
+    from ebuild.cli.commands import _find_recipe_dirs
+    from ebuild.packages.registry import create_registry
+    from ebuild.packages.resolver import PackageResolver
+
+    proj_dir = tmp_path / "project"
+    proj_recipes = proj_dir / "recipes"
+    proj_recipes.mkdir(parents=True)
+    (proj_recipes / "app.yaml").write_text(
+        """package: app
+version: "1.0.0"
+url: "https://custom-project.org/app-1.0.0.tar.gz"
+checksum: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+build: cmake
+dependencies:
+  - mbedtls
+""",
+        encoding="utf-8",
+    )
+    (proj_recipes / "mbedtls.yaml").write_text(
+        """package: mbedtls
+version: "3.6.0"
+url: "https://custom-project.org/mbedtls-PROJECT.tar.gz"
+checksum: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+build: cmake
+""",
+        encoding="utf-8",
+    )
+
+    remote_index_dir = tmp_path / "remote_index"
+    remote_recipes = remote_index_dir / "recipes"
+    remote_recipes.mkdir(parents=True)
+    (remote_recipes / "mbedtls.yaml").write_text(
+        """package: mbedtls
+version: "9.9.9"
+url: "https://remote-registry.org/mbedtls-REMOTE.tar.gz"
+checksum: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+build: cmake
+""",
+        encoding="utf-8",
+    )
+
+    recipe_dirs = _find_recipe_dirs(proj_dir, remote_index_dir=remote_index_dir)
+    registry = create_registry(*recipe_dirs)
+    resolver = PackageResolver(registry)
+
+    # Resolve top-level app pinned to 1.0.0; mbedtls is resolved transitively (unpinned)
+    resolved = resolver.resolve([{"name": "app", "version": "1.0.0"}])
+    by_name = {r.name: r for r in resolved}
+
+    assert "mbedtls" in by_name
+    mbedtls = by_name["mbedtls"]
+    # Must resolve to project recipe 3.6.0, NOT remote 9.9.9!
+    assert mbedtls.version == "3.6.0"
+    assert mbedtls.url == "https://custom-project.org/mbedtls-PROJECT.tar.gz"
+    assert mbedtls.checksum == "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
 
 def test_cli_search_command(tmp_path):

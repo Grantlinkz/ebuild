@@ -1719,20 +1719,43 @@ def search_packages(
 @click.pass_obj
 def update_index(log: Logger, index_url: Optional[str], offline: bool, force: bool) -> None:
     """Synchronize the local package index with the remote recipe repository."""
+    import json
     from ebuild.packages.index_sync import IndexSyncManager, IndexSyncError
 
     log.header("ebuild — Update Package Index")
     sync_mgr = IndexSyncManager()
 
+    prev_sha256 = None
+    if sync_mgr.meta_json.is_file():
+        try:
+            with open(sync_mgr.meta_json, "r", encoding="utf-8") as mf:
+                prev_sha256 = json.load(mf).get("sha256")
+        except Exception:
+            prev_sha256 = None
+
     try:
         res = sync_mgr.sync(url=index_url, force=force, offline=offline)
         count, msg = res[0], res[1]
         is_fallback = getattr(res, "is_fallback", False)
+        current_sha256 = getattr(res, "sha256", None)
+        if not current_sha256 and sync_mgr.meta_json.is_file():
+            try:
+                with open(sync_mgr.meta_json, "r", encoding="utf-8") as mf:
+                    current_sha256 = json.load(mf).get("sha256")
+            except Exception:
+                current_sha256 = None
+
         if is_fallback and not offline:
             log.warning(msg)
+            if current_sha256:
+                log.info(f"Index SHA-256 digest: {current_sha256}")
             log.info(f"Index cache located at: {sync_mgr.index_dir}")
             raise SystemExit(1)
         log.success(msg)
+        if current_sha256:
+            log.info(f"Index SHA-256 digest: {current_sha256}")
+            if prev_sha256 and prev_sha256 != current_sha256:
+                log.info(f"Index updated (previous digest: {prev_sha256})")
         log.info(f"Index cache located at: {sync_mgr.index_dir}")
     except IndexSyncError as e:
         log.error(f"Index update failed: {e}")

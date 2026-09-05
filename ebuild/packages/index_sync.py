@@ -53,16 +53,18 @@ class SyncResult(Tuple[int, str]):
     count: int
     message: str
     is_fallback: bool
+    sha256: Optional[str]
 
-    def __new__(cls, count: int, message: str, is_fallback: bool = False) -> SyncResult:
+    def __new__(cls, count: int, message: str, is_fallback: bool = False, sha256: Optional[str] = None) -> SyncResult:
         obj = super().__new__(cls, (count, message))
         obj.count = count
         obj.message = message
         obj.is_fallback = is_fallback
+        obj.sha256 = sha256
         return obj
 
     def __repr__(self) -> str:
-        return f"SyncResult(count={self.count}, message={self.message!r}, is_fallback={self.is_fallback})"
+        return f"SyncResult(count={self.count}, message={self.message!r}, is_fallback={self.is_fallback}, sha256={self.sha256!r})"
 
 
 def is_offline(offline_flag: bool = False) -> bool:
@@ -200,10 +202,12 @@ class IndexSyncManager:
                 if cache_age < CACHE_TTL_SECONDS:
                     cached = self.load_cached_entries()
                     count = len(cached)
+                    cached_meta_sha = cached_meta.get("sha256")
                     return SyncResult(
                         count,
                         f"Cache is up-to-date (synced recently). Use --force to re-download. ({count} packages)",
                         is_fallback=False,
+                        sha256=cached_meta_sha,
                     )
             except OSError:
                 pass
@@ -240,10 +244,12 @@ class IndexSyncManager:
             cached = self.load_cached_entries()
             if cached:
                 logger.warning("Remote sync failed (%s). Falling back to cached index.", e)
+                cached_meta_sha = cached_meta.get("sha256")
                 return SyncResult(
                     len(cached),
                     f"Network sync failed ({e}); fell back to cached index ({len(cached)} packages)",
                     is_fallback=True,
+                    sha256=cached_meta_sha,
                 )
             raise IndexSyncError(f"Failed to fetch remote package index and no cache is available: {e}") from e
 
@@ -302,6 +308,7 @@ class IndexSyncManager:
 
         # 6. Process and cache full recipe YAML definitions
         synced_count = 0
+        seen_recipe_stems: set[str] = set()
         for entry in valid_entries:
             pkg_name = sanitize_package_name(str(entry["name"]))
             recipe_filename = f"{pkg_name}.yaml"
@@ -327,13 +334,25 @@ class IndexSyncManager:
                     recipe = parse_recipe(recipe_dict)
                     with open(recipe_path, "w", encoding="utf-8") as rf:
                         yaml.safe_dump(recipe.to_dict(), rf, sort_keys=False)
+                    seen_recipe_stems.add(pkg_name)
                     synced_count += 1
                 except (RecipeError, ValueError) as re_err:
                     logger.warning("Skipping invalid recipe entry %s: %s", pkg_name, re_err)
                     continue
 
+        # Prune stale cached recipes not present in the newly synchronized index
+        if self.recipes_dir.is_dir():
+            for existing_file in list(self.recipes_dir.glob("*.yaml")) + list(self.recipes_dir.glob("*.yml")):
+                if existing_file.stem not in seen_recipe_stems:
+                    try:
+                        existing_file.unlink()
+                        logger.debug("Pruned stale cached recipe: %s", existing_file.name)
+                    except OSError as oe:
+                        logger.warning("Failed to prune stale recipe %s: %s", existing_file.name, oe)
+
         return SyncResult(
             synced_count,
             f"Successfully synchronized {synced_count} packages from remote index",
             is_fallback=False,
+            sha256=index_sha256,
         )
