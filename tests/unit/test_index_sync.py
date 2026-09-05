@@ -340,9 +340,13 @@ def test_index_sync_prunes_stale_cached_recipes(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp_a):
         res_a = mgr.sync(url="https://example.com/index-a.json", force=True)
         assert res_a.count == 1
+        assert res_a.pruned == 0
 
     recipe_files_a = sorted([f.name for f in mgr.recipes_dir.glob("*.yaml")])
     assert recipe_files_a == ["alpha.yaml"]
+
+    # Also add a stale .yml file (Finding 3: stale .yml must not survive sync)
+    (mgr.recipes_dir / "stale.yml").write_text("package: stale\nversion: 1.0.0", encoding="utf-8")
 
     # Second sync: index containing 'beta' (alpha withdrawn/absent)
     index_b = [
@@ -357,10 +361,36 @@ def test_index_sync_prunes_stale_cached_recipes(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp_b):
         res_b = mgr.sync(url="https://example.com/index-b.json", force=True)
         assert res_b.count == 1
+        # Both alpha.yaml and stale.yml must be counted as pruned
+        assert res_b.pruned == 2
 
-    recipe_files_b = sorted([f.name for f in mgr.recipes_dir.glob("*.yaml")])
-    # alpha.yaml must be pruned; only beta.yaml must remain!
+    recipe_files_b = sorted([f.name for f in mgr.recipes_dir.iterdir() if f.is_file()])
+    # alpha.yaml and stale.yml must be pruned; only beta.yaml must remain!
     assert recipe_files_b == ["beta.yaml"]
+
+
+def test_index_sync_preserves_cached_recipe_if_index_entry_lacks_url(tmp_path):
+    """Verify Finding 1: An index entry that loses URL still preserves cached recipe file."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+    mgr.ensure_directories()
+    (mgr.recipes_dir / "preserved.yaml").write_text(
+        "package: preserved\nversion: 1.0.0\nurl: https://example.com/preserved.tar.gz\nbuild: cmake\n",
+        encoding="utf-8",
+    )
+
+    index_data = [
+        {"name": "preserved", "version": "1.0.0", "description": "Entry without download URL"},
+    ]
+    raw_json = json.dumps(index_data).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+        assert res.pruned == 0
+        assert (mgr.recipes_dir / "preserved.yaml").is_file()
 
 
 def test_cli_update_index_reports_sha256_digest(tmp_path, monkeypatch):
@@ -382,3 +412,27 @@ def test_cli_update_index_reports_sha256_digest(tmp_path, monkeypatch):
         result = runner.invoke(cli, ["update-index", "--url", "https://example.com/index.json", "--force"])
         assert result.exit_code == 0
         assert "Index SHA-256 digest:" in result.output
+
+
+def test_cli_update_index_reports_pruned_count(tmp_path, monkeypatch):
+    """Verify Finding 2: CLI update-index surfaces count of pruned stale recipes."""
+    custom_dir = tmp_path / "index_cache"
+    recipes_dir = custom_dir / "recipes"
+    recipes_dir.mkdir(parents=True)
+    (recipes_dir / "old.yaml").write_text("package: old\nversion: 1.0.0\n", encoding="utf-8")
+    monkeypatch.setenv("EBUILD_INDEX_PATH", str(custom_dir))
+
+    index_data = [
+        {"name": "newpkg", "version": "1.0.0", "url": "https://example.com/newpkg.tar.gz"},
+    ]
+    raw_json = json.dumps(index_data).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    runner = CliRunner()
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        result = runner.invoke(cli, ["update-index", "--url", "https://example.com/index.json", "--force"])
+        assert result.exit_code == 0
+        assert "Pruned 1 stale cached recipe(s)" in result.output

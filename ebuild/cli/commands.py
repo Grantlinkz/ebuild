@@ -1735,9 +1735,10 @@ def update_index(log: Logger, index_url: Optional[str], offline: bool, force: bo
 
     try:
         res = sync_mgr.sync(url=index_url, force=force, offline=offline)
-        count, msg = res[0], res[1]
+        msg = res.message
         is_fallback = getattr(res, "is_fallback", False)
         current_sha256 = getattr(res, "sha256", None)
+        pruned_count = getattr(res, "pruned", 0)
         if not current_sha256 and sync_mgr.meta_json.is_file():
             try:
                 with open(sync_mgr.meta_json, "r", encoding="utf-8") as mf:
@@ -1756,6 +1757,8 @@ def update_index(log: Logger, index_url: Optional[str], offline: bool, force: bo
             log.info(f"Index SHA-256 digest: {current_sha256}")
             if prev_sha256 and prev_sha256 != current_sha256:
                 log.info(f"Index updated (previous digest: {prev_sha256})")
+        if pruned_count > 0:
+            log.info(f"Pruned {pruned_count} stale cached recipe(s)")
         log.info(f"Index cache located at: {sync_mgr.index_dir}")
     except IndexSyncError as e:
         log.error(f"Index update failed: {e}")

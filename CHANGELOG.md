@@ -13,6 +13,10 @@
   Supports `--all`, `--json`, `--build-system`, and `--license` filters.
 - **Index Synchronization Command (`ebuild update-index`).**
   CLI command to refresh local package and recipe index caches from remote repositories.
+- **Source-Ranked Recipe Precedence (`ebuild/packages/registry.py`).**
+  Enforces strict 3-tier precedence hierarchy during package resolution: project-local recipes (`./recipes/`) > system-shipped recipes (`recipes/`) > cached remote index recipes (`~/.ebuild/index/recipes/`), guaranteeing reproducible builds (§9.2) and ensuring project-level pins override remote definitions.
+- **Stale Cached Recipe Pruning (`ebuild/packages/index_sync.py`, `ebuild update-index`).**
+  `ebuild update-index` automatically prunes stale cached `.yaml` and `.yml` recipes from `~/.ebuild/index/recipes/` that are absent from the newly synchronized remote package index. Surfaced the count of pruned recipes in CLI output and returned `SyncResult`.
 - **Expanded Shipped Recipes Catalog (`recipes/`).**
   Added 5 verified recipes with HTTPS release pins and SHA-256 integrity digests:
   `cjson` (v1.7.18), `nanopb` (v0.4.9.1), `lvgl` (v9.2.2), `tinyusb` (v0.18.0), and `unity` (v2.6.1).

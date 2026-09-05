@@ -322,7 +322,14 @@ ebuild update-index --offline                   # Use local cached index without
 > **Index Authenticity & Provenance Notice (Unauthenticated Index)**:
 > Remote package index synchronization validates transport encryption (HTTPS only) and verifies individual package archive bytes against stated SHA-256 checksums. However, the index document itself is currently **unauthenticated** (detached cryptographic signature verification and package provenance proof are not yet implemented).
 >
-> In accordance with reproducible build guarantees (§9.2), project-local recipes in `./recipes/` take absolute precedence over remote index definitions. An index update will never override pinned URLs or checksums defined in your project repository.
+> In accordance with reproducible build guarantees (§9.2), recipe discovery enforces a strict 3-tier source-ranked precedence hierarchy:
+> 1. **Project-Local Recipes** (`./recipes/`): Absolute highest priority; project pins always override upstream.
+> 2. **Shipped Catalog Recipes** (`<ebuild>/recipes/`): Built-in verified recipes shipped with ebuild.
+> 3. **Cached Remote Index** (`~/.ebuild/index/recipes/`): Definitions synchronized from remote repositories.
+>
+> An index update will never override pinned URLs, build systems, or checksums defined in your project repository.
+>
+> Furthermore, `ebuild update-index` automatically prunes stale cached `.yaml` and `.yml` recipes from `~/.ebuild/index/recipes/` that are absent from the updated remote index, preventing retired packages from lingering in the local cache.
 >
 > To support integrity verification, the SHA-256 digest of the downloaded index is recorded in `~/.ebuild/index/packages.json.sha256`.
 

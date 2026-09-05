@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import yaml
 
@@ -47,24 +47,14 @@ class IndexSyncError(Exception):
     """Raised when index synchronization fails and cannot fallback."""
 
 
-class SyncResult(Tuple[int, str]):
+class SyncResult(NamedTuple):
     """Result of index synchronization, preserving tuple unpacking (count, message)."""
 
     count: int
     message: str
-    is_fallback: bool
-    sha256: Optional[str]
-
-    def __new__(cls, count: int, message: str, is_fallback: bool = False, sha256: Optional[str] = None) -> SyncResult:
-        obj = super().__new__(cls, (count, message))
-        obj.count = count
-        obj.message = message
-        obj.is_fallback = is_fallback
-        obj.sha256 = sha256
-        return obj
-
-    def __repr__(self) -> str:
-        return f"SyncResult(count={self.count}, message={self.message!r}, is_fallback={self.is_fallback}, sha256={self.sha256!r})"
+    is_fallback: bool = False
+    sha256: Optional[str] = None
+    pruned: int = 0
 
 
 def is_offline(offline_flag: bool = False) -> bool:
@@ -307,8 +297,8 @@ class IndexSyncManager:
         logger.info("Remote index SHA-256 digest: %s", index_sha256)
 
         # 6. Process and cache full recipe YAML definitions
+        keep = {f"{sanitize_package_name(str(e['name']))}.yaml" for e in valid_entries}
         synced_count = 0
-        seen_recipe_stems: set[str] = set()
         for entry in valid_entries:
             pkg_name = sanitize_package_name(str(entry["name"]))
             recipe_filename = f"{pkg_name}.yaml"
@@ -334,18 +324,19 @@ class IndexSyncManager:
                     recipe = parse_recipe(recipe_dict)
                     with open(recipe_path, "w", encoding="utf-8") as rf:
                         yaml.safe_dump(recipe.to_dict(), rf, sort_keys=False)
-                    seen_recipe_stems.add(pkg_name)
                     synced_count += 1
                 except (RecipeError, ValueError) as re_err:
                     logger.warning("Skipping invalid recipe entry %s: %s", pkg_name, re_err)
                     continue
 
         # Prune stale cached recipes not present in the newly synchronized index
+        pruned_count = 0
         if self.recipes_dir.is_dir():
             for existing_file in list(self.recipes_dir.glob("*.yaml")) + list(self.recipes_dir.glob("*.yml")):
-                if existing_file.stem not in seen_recipe_stems:
+                if existing_file.name not in keep:
                     try:
                         existing_file.unlink()
+                        pruned_count += 1
                         logger.debug("Pruned stale cached recipe: %s", existing_file.name)
                     except OSError as oe:
                         logger.warning("Failed to prune stale recipe %s: %s", existing_file.name, oe)
@@ -355,4 +346,5 @@ class IndexSyncManager:
             f"Successfully synchronized {synced_count} packages from remote index",
             is_fallback=False,
             sha256=index_sha256,
+            pruned=pruned_count,
         )
