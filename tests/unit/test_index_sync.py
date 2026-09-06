@@ -3,10 +3,7 @@
 
 """Unit tests for remote package index sync and offline caching."""
 
-import io
 import json
-import os
-import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -17,7 +14,6 @@ from click.testing import CliRunner
 
 from ebuild.cli.commands import cli
 from ebuild.packages.index_sync import (
-    DEFAULT_INDEX_URL,
     MAX_INDEX_SIZE_BYTES,
     IndexSyncError,
     IndexSyncManager,
@@ -238,7 +234,7 @@ def test_index_sync_force_and_staleness(tmp_path):
         mock_url.reset_mock()
 
         # 3. With force=True, urlopen must be called even for same URL
-        res_forced = mgr.sync(url="https://b.example/index.json", force=True)
+        mgr.sync(url="https://b.example/index.json", force=True)
         assert mock_url.called
 
 
@@ -436,3 +432,97 @@ def test_cli_update_index_reports_pruned_count(tmp_path, monkeypatch):
         result = runner.invoke(cli, ["update-index", "--url", "https://example.com/index.json", "--force"])
         assert result.exit_code == 0
         assert "Pruned 1 stale cached recipe(s)" in result.output
+
+
+def test_index_sync_empty_index_preserves_cache_and_warns(tmp_path):
+    """Verify Finding 1: An empty index payload refuses to prune cached recipes or wipe packages.json."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+    mgr.ensure_directories()
+
+    # Seed recipes
+    (mgr.recipes_dir / "alpha.yaml").write_text("package: alpha\nversion: 1.0.0\n", encoding="utf-8")
+    (mgr.recipes_dir / "bravo.yaml").write_text("package: bravo\nversion: 1.0.0\n", encoding="utf-8")
+    # Seed packages.json
+    seed_json = [{"name": "alpha", "version": "1.0.0"}, {"name": "bravo", "version": "1.0.0"}]
+    mgr.packages_json.write_text(json.dumps(seed_json), encoding="utf-8")
+
+    raw_json = json.dumps([]).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+        assert res.pruned == 0
+        assert res.count == 0
+
+    assert (mgr.recipes_dir / "alpha.yaml").is_file()
+    assert (mgr.recipes_dir / "bravo.yaml").is_file()
+    # packages.json must NOT be overwritten with []
+    cached = json.loads(mgr.packages_json.read_text(encoding="utf-8"))
+    assert len(cached) == 2
+
+
+def test_index_sync_unparseable_entries_preserves_cache(tmp_path):
+    """Verify Finding 1: An index with no usable entries refuses to prune cached recipes."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+    mgr.ensure_directories()
+
+    (mgr.recipes_dir / "alpha.yaml").write_text("package: alpha\nversion: 1.0.0\n", encoding="utf-8")
+    (mgr.recipes_dir / "bravo.yaml").write_text("package: bravo\nversion: 1.0.0\n", encoding="utf-8")
+
+    raw_json = json.dumps([{"nope": 1}, "str", 5]).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+        assert res.pruned == 0
+        assert res.count == 0
+
+    assert (mgr.recipes_dir / "alpha.yaml").is_file()
+    assert (mgr.recipes_dir / "bravo.yaml").is_file()
+
+
+def test_index_sync_preserves_yml_if_not_superseded_and_prunes_if_superseded(tmp_path):
+    """Verify Finding 5: Cached .yml is kept when index names entry without URL, and pruned when superseded by .yaml."""
+    mgr = IndexSyncManager(index_dir=tmp_path)
+    mgr.ensure_directories()
+
+    # Pre-existing .yml recipes in cache
+    (mgr.recipes_dir / "eps.yml").write_text("package: eps\nversion: 1.0.0\n", encoding="utf-8")
+    (mgr.recipes_dir / "delta.yml").write_text("package: delta\nversion: 9.9.9\n", encoding="utf-8")
+
+    # Index lists eps (no url -> no .yaml written) and delta (with url -> delta.yaml written)
+    index_data = [
+        {"name": "eps", "version": "1.0.0", "description": "Entry without download URL"},
+        {"name": "delta", "version": "2.0.0", "url": "https://example.com/delta.tar.gz"},
+    ]
+    raw_json = json.dumps(index_data).encode("utf-8")
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = raw_json
+    mock_resp.headers = {"Content-Length": str(len(raw_json))}
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = mgr.sync(url="https://example.com/index.json", force=True)
+        # delta.yml is pruned because delta.yaml superseded it; eps.yml is NOT pruned
+        assert res.pruned == 1
+
+    # eps.yml survived
+    assert (mgr.recipes_dir / "eps.yml").is_file()
+    # delta.yml was pruned and replaced by delta.yaml
+    assert not (mgr.recipes_dir / "delta.yml").exists()
+    assert (mgr.recipes_dir / "delta.yaml").is_file()
+
+
+def test_changelog_trailing_newline():
+    """Verify Finding 2 & Finding 6: CHANGELOG.md ends with a trailing newline."""
+    changelog_path = Path(__file__).resolve().parents[2] / "CHANGELOG.md"
+    assert changelog_path.is_file()
+    content = changelog_path.read_bytes()
+    assert content.endswith(b"\n")
+

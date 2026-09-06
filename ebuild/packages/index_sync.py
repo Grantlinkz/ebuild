@@ -19,11 +19,11 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional
 
 import yaml
 
-from ebuild.packages.recipe import PackageRecipe, RecipeError, parse_recipe
+from ebuild.packages.recipe import RecipeError, parse_recipe
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +48,9 @@ class IndexSyncError(Exception):
 
 
 class SyncResult(NamedTuple):
-    """Result of index synchronization, preserving tuple unpacking (count, message)."""
+    """Result of index synchronization."""
 
-    count: int
+    count: int  # type: ignore[assignment]
     message: str
     is_fallback: bool = False
     sha256: Optional[str] = None
@@ -152,7 +152,7 @@ class IndexSyncManager:
             timeout: Network timeout in seconds.
 
         Returns:
-            SyncResult of (package_count, status_message, is_fallback).
+            SyncResult with count, message, is_fallback, sha256, and pruned.
         """
         target_url = (url or self.default_url).strip()
         self.ensure_directories()
@@ -270,10 +270,11 @@ class IndexSyncManager:
                 continue
 
         # 4. Write cached packages.json atomically with sanitized entries only
-        temp_json = self.packages_json.with_suffix(".tmp")
-        with open(temp_json, "w", encoding="utf-8") as f:
-            json.dump(valid_entries, f, indent=2)
-        temp_json.replace(self.packages_json)
+        if valid_entries:
+            temp_json = self.packages_json.with_suffix(".tmp")
+            with open(temp_json, "w", encoding="utf-8") as f:
+                json.dump(valid_entries, f, indent=2)
+            temp_json.replace(self.packages_json)
 
         # 5. Record SHA-256 digest of the downloaded index for integrity visibility
         index_sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -297,8 +298,8 @@ class IndexSyncManager:
         logger.info("Remote index SHA-256 digest: %s", index_sha256)
 
         # 6. Process and cache full recipe YAML definitions
-        keep = {f"{sanitize_package_name(str(e['name']))}.yaml" for e in valid_entries}
         synced_count = 0
+        written_yaml_stems: set[str] = set()
         for entry in valid_entries:
             pkg_name = sanitize_package_name(str(entry["name"]))
             recipe_filename = f"{pkg_name}.yaml"
@@ -325,13 +326,29 @@ class IndexSyncManager:
                     with open(recipe_path, "w", encoding="utf-8") as rf:
                         yaml.safe_dump(recipe.to_dict(), rf, sort_keys=False)
                     synced_count += 1
+                    written_yaml_stems.add(pkg_name)
                 except (RecipeError, ValueError) as re_err:
                     logger.warning("Skipping invalid recipe entry %s: %s", pkg_name, re_err)
                     continue
 
         # Prune stale cached recipes not present in the newly synchronized index
         pruned_count = 0
-        if self.recipes_dir.is_dir():
+        if not valid_entries:
+            cached_count = (
+                len(list(self.recipes_dir.glob("*.yaml")) + list(self.recipes_dir.glob("*.yml")))
+                if self.recipes_dir.is_dir()
+                else 0
+            )
+            logger.warning(
+                "Index contained no usable entries; keeping %d cached recipes", cached_count
+            )
+        elif self.recipes_dir.is_dir():
+            keep = {f"{sanitize_package_name(str(e['name']))}.yaml" for e in valid_entries}
+            keep.update(
+                f"{sanitize_package_name(str(e['name']))}.yml"
+                for e in valid_entries
+                if sanitize_package_name(str(e['name'])) not in written_yaml_stems
+            )
             for existing_file in list(self.recipes_dir.glob("*.yaml")) + list(self.recipes_dir.glob("*.yml")):
                 if existing_file.name not in keep:
                     try:
