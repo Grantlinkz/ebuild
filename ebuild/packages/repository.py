@@ -1,3 +1,4 @@
+
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 EoS Project
 
@@ -15,7 +16,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ebuild.packages.index_sync import IndexSyncManager, get_default_index_dir, sanitize_package_name
+from ebuild.packages.index_sync import IndexSyncManager, sanitize_package_name
 from ebuild.packages.registry import PackageRegistry, create_registry, find_recipe_dirs
 
 logger = logging.getLogger(__name__)

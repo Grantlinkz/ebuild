@@ -329,7 +329,7 @@ ebuild update-index --offline                   # Use local cached index without
 >
 > An index update will never override pinned URLs, build systems, or checksums defined in your project repository.
 >
-> Furthermore, `ebuild update-index` automatically prunes stale cached `.yaml` and `.yml` recipes from `~/.ebuild/index/recipes/` that are absent from the updated remote index, preventing retired packages from lingering in the local cache.
+> Furthermore, `ebuild update-index` automatically prunes stale cached `.yaml` and `.yml` recipes from `~/.ebuild/index/recipes/` that are absent from the updated remote index, preventing retired packages from lingering in the local cache. An index that yields no usable entries is treated as a delivery fault: nothing is pruned, the cached index is left in place, and the condition is reported.
 >
 > To support integrity verification, the SHA-256 digest of the downloaded index is recorded in `~/.ebuild/index/packages.json.sha256`.
 

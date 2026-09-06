@@ -50,7 +50,7 @@ class IndexSyncError(Exception):
 class SyncResult(NamedTuple):
     """Result of index synchronization."""
 
-    count: int  # type: ignore[assignment]
+    package_count: int
     message: str
     is_fallback: bool = False
     sha256: Optional[str] = None
@@ -152,7 +152,7 @@ class IndexSyncManager:
             timeout: Network timeout in seconds.
 
         Returns:
-            SyncResult with count, message, is_fallback, sha256, and pruned.
+            SyncResult with package_count, message, is_fallback, sha256, and pruned.
         """
         target_url = (url or self.default_url).strip()
         self.ensure_directories()
@@ -188,7 +188,10 @@ class IndexSyncManager:
 
         if not force and same_origin and self.packages_json.is_file():
             try:
-                cache_age = time.time() - self.packages_json.stat().st_mtime
+                synced_at = cached_meta.get("synced_at")
+                if synced_at is None:
+                    synced_at = self.packages_json.stat().st_mtime
+                cache_age = time.time() - float(synced_at)
                 if cache_age < CACHE_TTL_SECONDS:
                     cached = self.load_cached_entries()
                     count = len(cached)
@@ -269,12 +272,36 @@ class IndexSyncManager:
                 logger.warning("Skipping unsafe package entry: %s", ve)
                 continue
 
-        # 4. Write cached packages.json atomically with sanitized entries only
-        if valid_entries:
-            temp_json = self.packages_json.with_suffix(".tmp")
-            with open(temp_json, "w", encoding="utf-8") as f:
-                json.dump(valid_entries, f, indent=2)
-            temp_json.replace(self.packages_json)
+        # 4. If index contains no usable entries, treat as delivery fault: keep existing cache untouched
+        if not valid_entries:
+            cached_count = (
+                len(list(self.recipes_dir.glob("*.yaml")) + list(self.recipes_dir.glob("*.yml")))
+                if self.recipes_dir.is_dir()
+                else 0
+            )
+            msg = f"Remote package index contained no usable entries; keeping {cached_count} cached recipes"
+            logger.warning(msg)
+            cached_meta_sha = None
+            if self.meta_json.is_file():
+                try:
+                    with open(self.meta_json, "r", encoding="utf-8") as mf:
+                        cached_meta_sha = json.load(mf).get("sha256")
+                except Exception:
+                    pass
+            cached_entries = self.load_cached_entries()
+            return SyncResult(
+                package_count=len(cached_entries),
+                message=msg,
+                is_fallback=True,
+                sha256=cached_meta_sha,
+                pruned=0,
+            )
+
+        # Write cached packages.json atomically with sanitized entries only
+        temp_json = self.packages_json.with_suffix(".tmp")
+        with open(temp_json, "w", encoding="utf-8") as f:
+            json.dump(valid_entries, f, indent=2)
+        temp_json.replace(self.packages_json)
 
         # 5. Record SHA-256 digest of the downloaded index for integrity visibility
         index_sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -333,16 +360,7 @@ class IndexSyncManager:
 
         # Prune stale cached recipes not present in the newly synchronized index
         pruned_count = 0
-        if not valid_entries:
-            cached_count = (
-                len(list(self.recipes_dir.glob("*.yaml")) + list(self.recipes_dir.glob("*.yml")))
-                if self.recipes_dir.is_dir()
-                else 0
-            )
-            logger.warning(
-                "Index contained no usable entries; keeping %d cached recipes", cached_count
-            )
-        elif self.recipes_dir.is_dir():
+        if self.recipes_dir.is_dir():
             keep = {f"{sanitize_package_name(str(e['name']))}.yaml" for e in valid_entries}
             keep.update(
                 f"{sanitize_package_name(str(e['name']))}.yml"
@@ -365,3 +383,4 @@ class IndexSyncManager:
             sha256=index_sha256,
             pruned=pruned_count,
         )
+

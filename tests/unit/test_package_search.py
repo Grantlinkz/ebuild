@@ -4,12 +4,11 @@
 """Unit tests for package discovery and search across repository sources."""
 
 import json
-from pathlib import Path
 from click.testing import CliRunner
 
 from ebuild.cli.commands import cli
 from ebuild.packages.index_sync import IndexSyncManager
-from ebuild.packages.repository import PackageInfo, PackageRepository
+from ebuild.packages.repository import PackageRepository
 
 
 def test_package_repository_search(tmp_path):

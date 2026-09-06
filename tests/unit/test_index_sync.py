@@ -95,7 +95,7 @@ def test_index_sync_success(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp):
         res = mgr.sync(url="https://example.com/index.json", force=True)
 
-    assert res.count == 1
+    assert res.package_count == 1
     assert not res.is_fallback
     assert "Successfully synchronized 1 packages" in res.message
     assert mgr.packages_json.is_file()
@@ -134,7 +134,7 @@ def test_index_sync_network_error_fallback(tmp_path):
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("No connection")):
         res = mgr.sync(url="https://example.com/index.json", force=True)
 
-    assert res.count == 1
+    assert res.package_count == 1
     assert res.is_fallback
     assert "fell back to cached index" in res.message
 
@@ -147,7 +147,7 @@ def test_index_sync_offline_mode(tmp_path):
     mgr.packages_json.write_text(json.dumps(cached_data), encoding="utf-8")
 
     res = mgr.sync(offline=True)
-    assert res.count == 1
+    assert res.package_count == 1
     assert not res.is_fallback
     assert "Offline mode" in res.message
 
@@ -188,7 +188,7 @@ def test_index_sync_filters_unsafe_and_counts_accurately(tmp_path):
         res = mgr.sync(url="https://example.com/index.json", force=True)
 
     # Only good-pkg had a URL and passed validation -> 1 recipe written
-    assert res.count == 1
+    assert res.package_count == 1
     assert "Successfully synchronized 1 packages" in res.message
 
     # Verify packages.json does not contain "bad name!"
@@ -222,14 +222,14 @@ def test_index_sync_force_and_staleness(tmp_path):
 
         # 1. Fresh cache (< 24h) from same URL without force -> reuses cache
         res = mgr.sync(url="https://a.example/index.json", force=False)
-        assert res.count == 1
+        assert res.package_count == 1
         assert "Cache is up-to-date" in res.message
         mock_url.assert_not_called()
 
         # 2. Fresh cache (< 24h) but requested URL is DIFFERENT -> fetches new URL! (Finding 2)
         res_diff_url = mgr.sync(url="https://b.example/index.json", force=False)
         assert mock_url.called
-        assert res_diff_url.count == 1
+        assert res_diff_url.package_count == 1
 
         mock_url.reset_mock()
 
@@ -270,7 +270,7 @@ def test_index_sync_size_cap_and_lying_content_length(tmp_path):
 
     with patch("urllib.request.urlopen", return_value=mock_resp3):
         res = mgr.sync(url="https://example.com/index.json", force=True)
-        assert res.count == 1
+        assert res.package_count == 1
 
 
 def test_index_sync_deduplicates_duplicate_names(tmp_path):
@@ -291,7 +291,7 @@ def test_index_sync_deduplicates_duplicate_names(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp):
         res = mgr.sync(url="https://example.com/index.json", force=True)
 
-    assert res.count == 1
+    assert res.package_count == 1
     assert "Successfully synchronized 1 packages" in res.message
     # Verify recipes dir has only 1 file
     recipe_files = list(mgr.recipes_dir.glob("*.yaml"))
@@ -335,7 +335,7 @@ def test_index_sync_prunes_stale_cached_recipes(tmp_path):
 
     with patch("urllib.request.urlopen", return_value=mock_resp_a):
         res_a = mgr.sync(url="https://example.com/index-a.json", force=True)
-        assert res_a.count == 1
+        assert res_a.package_count == 1
         assert res_a.pruned == 0
 
     recipe_files_a = sorted([f.name for f in mgr.recipes_dir.glob("*.yaml")])
@@ -356,7 +356,7 @@ def test_index_sync_prunes_stale_cached_recipes(tmp_path):
 
     with patch("urllib.request.urlopen", return_value=mock_resp_b):
         res_b = mgr.sync(url="https://example.com/index-b.json", force=True)
-        assert res_b.count == 1
+        assert res_b.package_count == 1
         # Both alpha.yaml and stale.yml must be counted as pruned
         assert res_b.pruned == 2
 
@@ -435,7 +435,7 @@ def test_cli_update_index_reports_pruned_count(tmp_path, monkeypatch):
 
 
 def test_index_sync_empty_index_preserves_cache_and_warns(tmp_path):
-    """Verify Finding 1: An empty index payload refuses to prune cached recipes or wipe packages.json."""
+    """Verify Finding 1 & Finding 2: An empty index payload refuses to prune cached recipes, does not overwrite metadata, and reports fallback."""
     mgr = IndexSyncManager(index_dir=tmp_path)
     mgr.ensure_directories()
 
@@ -446,6 +446,16 @@ def test_index_sync_empty_index_preserves_cache_and_warns(tmp_path):
     seed_json = [{"name": "alpha", "version": "1.0.0"}, {"name": "bravo", "version": "1.0.0"}]
     mgr.packages_json.write_text(json.dumps(seed_json), encoding="utf-8")
 
+    # Seed index-meta.json and sha256 sidecar
+    initial_meta = {
+        "url": "https://example.com/index.json",
+        "sha256": "initial_sha_12345",
+        "synced_at": 1000.0,
+    }
+    mgr.meta_json.write_text(json.dumps(initial_meta), encoding="utf-8")
+    sha_file = mgr.packages_json.with_name(mgr.packages_json.name + ".sha256")
+    sha_file.write_text("initial_sha_12345  packages.json\n", encoding="utf-8")
+
     raw_json = json.dumps([]).encode("utf-8")
     mock_resp = MagicMock()
     mock_resp.read.return_value = raw_json
@@ -455,7 +465,8 @@ def test_index_sync_empty_index_preserves_cache_and_warns(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp):
         res = mgr.sync(url="https://example.com/index.json", force=True)
         assert res.pruned == 0
-        assert res.count == 0
+        assert res.package_count == 2
+        assert res.is_fallback is True
 
     assert (mgr.recipes_dir / "alpha.yaml").is_file()
     assert (mgr.recipes_dir / "bravo.yaml").is_file()
@@ -463,9 +474,21 @@ def test_index_sync_empty_index_preserves_cache_and_warns(tmp_path):
     cached = json.loads(mgr.packages_json.read_text(encoding="utf-8"))
     assert len(cached) == 2
 
+    # index-meta.json and packages.json.sha256 must NOT be overwritten with [] metadata
+    meta_after = json.loads(mgr.meta_json.read_text(encoding="utf-8"))
+    assert meta_after["sha256"] == "initial_sha_12345"
+    assert meta_after["synced_at"] == 1000.0
+    assert sha_file.read_text(encoding="utf-8") == "initial_sha_12345  packages.json\n"
+
+    # Subsequent non-forced sync must retry via network (not short-circuited by 24h TTL)
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_retry:
+        res_retry = mgr.sync(url="https://example.com/index.json", force=False)
+        assert mock_retry.called
+        assert res_retry.is_fallback is True
+
 
 def test_index_sync_unparseable_entries_preserves_cache(tmp_path):
-    """Verify Finding 1: An index with no usable entries refuses to prune cached recipes."""
+    """Verify Finding 1: An index with no usable entries refuses to prune cached recipes and reports fallback."""
     mgr = IndexSyncManager(index_dir=tmp_path)
     mgr.ensure_directories()
 
@@ -481,7 +504,8 @@ def test_index_sync_unparseable_entries_preserves_cache(tmp_path):
     with patch("urllib.request.urlopen", return_value=mock_resp):
         res = mgr.sync(url="https://example.com/index.json", force=True)
         assert res.pruned == 0
-        assert res.count == 0
+        assert res.package_count == 0
+        assert res.is_fallback is True
 
     assert (mgr.recipes_dir / "alpha.yaml").is_file()
     assert (mgr.recipes_dir / "bravo.yaml").is_file()
